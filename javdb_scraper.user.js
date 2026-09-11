@@ -20,8 +20,8 @@
 // @connect      javdb574.com
 // @connect      app.javdb575.com
 // @connect      app.javdb574.com
-// @updateURL    https://raw.githubusercontent.com/lijianbin2/1/main/javdb_scraper.user.js
-// @downloadURL  https://raw.githubusercontent.com/lijianbin2/1/main/javdb_scraper.user.js
+// @updateURL    https://raw.githubusercontent.com/lijianbin2/javdb/main/javdb_scraper.user.js
+// @downloadURL  https://raw.githubusercontent.com/lijianbin2/javdb/main/javdb_scraper.user.js
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
