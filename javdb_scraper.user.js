@@ -1,12 +1,12 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.12.4
+// @version      5.12.5
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
-// @match        *://*.javdb574.com/*
-// @match        *://javdb574.com/*
+// @match        *://*.javdb575.com/*
+// @match        *://javdb575.com/*
 // @match        *://*.javdb*.*/*
 // @match        *://javdb*.*/*
 // @include      /^https?:\/\/(www\.)?javdb\d*\.(com|org|net)\/.*$/
@@ -17,9 +17,9 @@
 // @grant        GM_registerMenuCommand
 // @connect      t.me
 // @connect      javdb.com
-// @connect      javdb574.com
+// @connect      javdb575.com
 // @connect      app.javdb575.com
-// @connect      app.javdb574.com
+// @connect      app.javdb575.com
 // @updateURL    https://raw.githubusercontent.com/lijianbin2/javdb/main/javdb_scraper.user.js
 // @downloadURL  https://raw.githubusercontent.com/lijianbin2/javdb/main/javdb_scraper.user.js
 // @run-at       document-idle
@@ -204,8 +204,8 @@
 
   // 纯数字备用域名列表（兜底）
   const STATIC_BACKUP_DOMAINS = [
-    'javdb574.com', 'javdb573.com', 'javdb572.com',
-    'javdb571.com', 'javdb570.com', 'javdb569.com'
+    'javdb575.com', 'javdb574.com', 'javdb573.com',
+    'javdb572.com', 'javdb571.com', 'javdb570.com'
   ];
   // 自动更新域名：缓存键与定时
   const DOMAIN_CACHE_KEY = 'javdb_latest_domain';
@@ -350,8 +350,8 @@
     return parseMaxJavdbDomain(html);
   }
   async function fetchLatestDomainFromApp() {
-    // 官方 App 关于页常见域名：app.javdb575.com / app.javdb574.com
-    const urls = ['https://app.javdb575.com/', 'https://app.javdb574.com/', 'https://app.javdb.com/'];
+    // 官方 App 关于页常见域名：app.javdb575.com / app.javdb575.com
+    const urls = ['https://app.javdb575.com/', 'https://app.javdb575.com/', 'https://app.javdb.com/'];
     for (const u of urls) {
       const r = await gmGet(u);
       if (r && r.status === 200 && r.responseText) {
@@ -518,7 +518,7 @@
   panel.id = 'javdb-scraper-panel';
   panel.innerHTML = `
     <div id="scraper-header" style="font-weight: bold; margin-bottom: 8px; font-size: 14px; border-bottom: 1px solid #444; padding-bottom: 4px; cursor: move; user-select: none; display: flex; justify-content: space-between; align-items: center;">
-      <span>🐢 JavDB 磁链提取器 v5.12.4 (自动更新域名版)</span>
+      <span>🐢 JavDB 磁链提取器 v5.12.5 (自动更新域名版)</span>
       <span style="font-size: 10px; color: #888;">(按住拖动)</span>
     </div>
 

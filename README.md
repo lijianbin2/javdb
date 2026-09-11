@@ -1,4 +1,4 @@
-# JavDB 万能磁链提取器
+﻿# JavDB 万能磁链提取器
 
 Tampermonkey 油猴脚本，一键批量提取 JavDB 磁力链接，支持多模式、多标签排队与备用域名自动切换。
 
@@ -26,7 +26,7 @@ Tampermonkey → 打开以下任一链接 → 安装
 
 本地：`H:\Codex\javdb脚本\javdb_scraper.user.js` 拖入扩展管理
 
-脚本头已配置 @updateURL / @downloadURL，Tampermonkey 会自动检测更新（当前 v5.12.4）。
+脚本头已配置 @updateURL / @downloadURL，Tampermonkey 会自动检测更新（当前 v5.12.5）。
 
 ## 使用
 
