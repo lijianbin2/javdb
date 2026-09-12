@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.1
+// @version      5.13.2
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -127,81 +127,88 @@
     return tesseractLoading;
   }
 
-  function preprocessImageToCanvas(img) {
-    const scale = 2.2;
-    const canvas = document.createElement('canvas');
-    const w = img.naturalWidth || 200;
-    const h = img.naturalHeight || 70;
-    canvas.width = Math.round(w * scale);
-    canvas.height = Math.round(h * scale);
-    const ctx = canvas.getContext('2d');
-    ctx.imageSmoothingEnabled = false;
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-    try {
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const d = imageData.data;
-      for (let i = 0; i < d.length; i += 4) {
-        const r = d[i], g = d[i+1], b = d[i+2];
-        const gray = 0.299 * r + 0.587 * g + 0.114 * b;
-        // 白底深蓝字：白 ~255，字 ~30-80 灰度；阈值160
-        const bw = gray > 160 ? 255 : 0;
-        d[i] = d[i+1] = d[i+2] = bw;
-        // alpha keep 255
+  function preprocessImageToCanvas(img, opts = {}) {
+      const scale = opts.scale || 3;
+      const threshold = opts.threshold != null ? opts.threshold : 155;
+      const doBinarize = opts.binarize !== false;
+      const canvas = document.createElement("canvas");
+      const w = img.naturalWidth || 200;
+      const h = img.naturalHeight || 70;
+      canvas.width = Math.round(w * scale);
+      canvas.height = Math.round(h * scale);
+      const ctx = canvas.getContext("2d");
+      ctx.imageSmoothingEnabled = false;
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      try {
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const d = imageData.data;
+        let min = 255, max = 0;
+        const grays = new Uint8Array(canvas.width * canvas.height);
+        for (let i = 0, j = 0; i < d.length; i += 4, j++) {
+          const g = 0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2];
+          grays[j] = g;
+          if (g < min) min = g;
+          if (g > max) max = g;
+        }
+        const range = max - min || 1;
+        for (let i = 0, j = 0; i < d.length; i += 4, j++) {
+          let g = (grays[j] - min) * 255 / range;
+          if (doBinarize) {
+            const bw = g > threshold ? 255 : 0;
+            d[i] = d[i+1] = d[i+2] = bw;
+          } else {
+            g = Math.max(0, Math.min(255, g));
+            d[i] = d[i+1] = d[i+2] = g;
+          }
+          d[i+3] = 255;
+        }
+        ctx.putImageData(imageData, 0, 0);
+      } catch (e) {
+        console.warn("[JavDB captcha] canvas preprocess failed", e);
       }
-      ctx.putImageData(imageData, 0, 0);
-    } catch (e) {
-      console.warn('[JavDB captcha] canvas preprocess failed', e);
+      return canvas;
     }
-    return canvas;
-  }
 
   async function recognizeAndFillCaptcha(img, input, statusEl) {
-    if (!img || !input) return;
-    if (statusEl) {
-      statusEl.textContent = '🤖 正在识别验证码...';
-      statusEl.style.color = '#666';
-    }
-    try {
-      const T = await ensureTesseract();
-      const canvas = preprocessImageToCanvas(img);
-      // Tesseract 5 API: T.recognize(canvas, 'eng', options)
-      const result = await T.recognize(canvas, 'eng', {
-        tessedit_char_whitelist: 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ',
-        tessedit_pageseg_mode: '7'
-      });
-      const raw = (result && result.data && result.data.text) ? result.data.text : '';
-      const conf = (result && result.data && typeof result.data.confidence === 'number') ? result.data.confidence : 0;
-      let clean = raw.replace(/[^a-zA-Z]/g, '').trim().slice(0, 5).toLowerCase();
-      if (statusEl) {
-        if (clean && clean.length >= 4) {
-          statusEl.textContent = '✅ 识别结果: ' + clean + ' (置信度 ' + Math.round(conf) + '%) 已自动填入，提交前请核对';
-          statusEl.style.color = '#0a7a0a';
-        } else if (clean) {
-          statusEl.textContent = '⚠️ 识别结果: \"' + clean + '\" 不确定，请手动核对或点击图片重试 (置信度 ' + Math.round(conf) + '%)';
-          statusEl.style.color = '#b77900';
-        } else {
-          statusEl.textContent = '⚠️ 未能识别，请手动输入或点击图片刷新后重试';
-          statusEl.style.color = '#b77900';
+      if (!img || !input) return;
+      if (statusEl) { statusEl.textContent = "⏳ 正在识别验证码..."; statusEl.style.color = "#666"; }
+      try {
+        const T = await ensureTesseract();
+        const variants = [
+          { scale: 3, threshold: 150, binarize: true },
+          { scale: 3, threshold: 128, binarize: true },
+          { scale: 3, threshold: 175, binarize: true },
+          { scale: 2.8, threshold: 155, binarize: true },
+          { scale: 3, binarize: false }
+        ];
+        let best = { clean: "", conf: 0, raw: "" };
+        for (const v of variants) {
+          try {
+            const canvas = preprocessImageToCanvas(img, v);
+            const result = await T.recognize(canvas, "eng", { tessedit_char_whitelist: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", tessedit_pageseg_mode: "7" });
+            const raw = (result && result.data && result.data.text) ? result.data.text : "";
+            const conf = (result && result.data && typeof result.data.confidence === "number") ? result.data.confidence : 0;
+            let clean = raw.replace(/[^a-zA-Z]/g, "").trim().slice(0, 5).toLowerCase();
+            if (clean.length > best.clean.length || (clean.length === best.clean.length && conf > best.conf)) best = { clean, conf, raw };
+            if (best.clean.length >= 5 && best.conf > 65) break;
+            if (best.clean.length >= 4 && best.conf > 75) break;
+          } catch (e) { console.warn("[JavDB captcha] variant failed", v, e); }
         }
-      }
-      if (clean && clean.length >= 3) {
-        input.value = clean;
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-        // 不自动提交，留给用户确认；若置信度高可聚焦密码框
-        try { input.focus(); } catch (e) {}
-      }
-      return clean;
-    } catch (e) {
-      console.error('[JavDB captcha] recognize failed', e);
-      if (statusEl) {
-        statusEl.textContent = '❌ 识别失败: ' + (e.message || e) + '，请手动输入或点击图片重试';
-        statusEl.style.color = '#d00';
+        const clean = best.clean; const conf = best.conf;
+        if (statusEl) {
+          if (clean && clean.length >= 4) { statusEl.textContent = "✅ 识别: " + clean + " (置信度 " + Math.round(conf) + "%) 已自动填入，提交前请核对"; statusEl.style.color = "#0a7a0a"; }
+          else if (clean) { statusEl.textContent = "⚠️ 识别: \"" + clean + "\" 不确定，请手动核对或点图片重试 (置信度 " + Math.round(conf) + "%)"; statusEl.style.color = "#b77900"; }
+          else { statusEl.textContent = "⚠️ 未能识别，请手动输入或点击图片刷新后重试"; statusEl.style.color = "#b77900"; }
+        }
+        if (clean && clean.length >= 3) { input.value = clean; input.dispatchEvent(new Event("input", { bubbles: true })); input.dispatchEvent(new Event("change", { bubbles: true })); try { input.focus(); } catch (e) {} }
+        return clean;
+      } catch (e) {
+        console.error("[JavDB captcha] recognize failed", e);
+        if (statusEl) { statusEl.textContent = "❌ 识别失败: " + (e.message || e) + "，请手动输入或点图片重试"; statusEl.style.color = "#d00"; }
       }
     }
-  }
 
   function setupRuCaptchaAutoInput() {
     const img = document.querySelector('img.rucaptcha-image');
