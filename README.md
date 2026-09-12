@@ -15,6 +15,7 @@ Tampermonkey 油猴脚本，一键批量提取 JavDB 磁力链接，支持多模
   - 每 6 小时自动从 javdb.com / t.me/s/javdbnews / 官方App 同步最新 javdbNNN.com
   - 双写缓存 GM_*/localStorage，封禁时优先用缓存，实时多源兜底，递减备用列表
   - 面板仅显示 最新域名: javdb575.com (来源 · Xh前)
+- **登录验证码自动识别**：`javdb.com/login` 的 `/rucaptcha/` 5位字母图形验证码自动 OCR 填入（Tesseract.js + canvas 预处理），显示置信度，支持点击图片刷新后重识别
 - **面板**：可拖动，显示状态/进度/日志，支持停止
 
 ## 安装
@@ -26,7 +27,7 @@ Tampermonkey → 打开以下任一链接 → 安装
 
 本地：`H:\Codex\javdb脚本\javdb_scraper.user.js` 拖入扩展管理
 
-脚本头已配置 @updateURL / @downloadURL，Tampermonkey 会自动检测更新（当前 v5.12.5）。
+脚本头已配置 @updateURL / @downloadURL，Tampermonkey 会自动检测更新（当前 v5.13.0）。
 
 ## 使用
 
