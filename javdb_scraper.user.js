@@ -1,8 +1,8 @@
-﻿// ==UserScript==
+// ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.12.5
-// @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 VR 及时长超过 2.5 小时的作品。
+// @version      5.13.0
+// @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
 // @match        *://*.javdb575.com/*
@@ -19,7 +19,7 @@
 // @connect      javdb.com
 // @connect      javdb575.com
 // @connect      app.javdb575.com
-// @connect      app.javdb575.com
+// @connect      cdn.jsdelivr.net
 // @updateURL    https://raw.githubusercontent.com/lijianbin2/javdb/main/javdb_scraper.user.js
 // @downloadURL  https://raw.githubusercontent.com/lijianbin2/javdb/main/javdb_scraper.user.js
 // @run-at       document-idle
@@ -57,6 +57,186 @@
   } else {
     autoCheckRememberMe();
   }
+
+  // ==================== 登录图形验证码自动输入 (rucaptcha) ====================
+  // 针对 https://javdb.com/login 的 5位字母图形验证码 /rucaptcha/ 自动OCR填入
+  // 使用 Tesseract.js CDN 懒加载，canvas 预处理（放大2倍+灰度二值化），失败可手动重试
+  let tesseractLoading = null;
+  function ensureTesseract() {
+    if (window.Tesseract) return Promise.resolve(window.Tesseract);
+    if (tesseractLoading) return tesseractLoading;
+    tesseractLoading = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+      s.onload = () => {
+        if (window.Tesseract) resolve(window.Tesseract);
+        else reject(new Error('Tesseract not found after load'));
+      };
+      s.onerror = () => reject(new Error('Tesseract CDN load failed'));
+      document.head.appendChild(s);
+    });
+    return tesseractLoading;
+  }
+
+  function preprocessImageToCanvas(img) {
+    const scale = 2.2;
+    const canvas = document.createElement('canvas');
+    const w = img.naturalWidth || 200;
+    const h = img.naturalHeight || 70;
+    canvas.width = Math.round(w * scale);
+    canvas.height = Math.round(h * scale);
+    const ctx = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = false;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    try {
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const d = imageData.data;
+      for (let i = 0; i < d.length; i += 4) {
+        const r = d[i], g = d[i+1], b = d[i+2];
+        const gray = 0.299 * r + 0.587 * g + 0.114 * b;
+        // 白底深蓝字：白 ~255，字 ~30-80 灰度；阈值160
+        const bw = gray > 160 ? 255 : 0;
+        d[i] = d[i+1] = d[i+2] = bw;
+        // alpha keep 255
+      }
+      ctx.putImageData(imageData, 0, 0);
+    } catch (e) {
+      console.warn('[JavDB captcha] canvas preprocess failed', e);
+    }
+    return canvas;
+  }
+
+  async function recognizeAndFillCaptcha(img, input, statusEl) {
+    if (!img || !input) return;
+    if (statusEl) {
+      statusEl.textContent = '🤖 正在识别验证码...';
+      statusEl.style.color = '#666';
+    }
+    try {
+      const T = await ensureTesseract();
+      const canvas = preprocessImageToCanvas(img);
+      // Tesseract 5 API: T.recognize(canvas, 'eng', options)
+      const result = await T.recognize(canvas, 'eng', {
+        tessedit_char_whitelist: 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ',
+        tessedit_pageseg_mode: '7'
+      });
+      const raw = (result && result.data && result.data.text) ? result.data.text : '';
+      const conf = (result && result.data && typeof result.data.confidence === 'number') ? result.data.confidence : 0;
+      let clean = raw.replace(/[^a-zA-Z]/g, '').trim().slice(0, 5).toLowerCase();
+      if (statusEl) {
+        if (clean && clean.length >= 4) {
+          statusEl.textContent = '✅ 识别结果: ' + clean + ' (置信度 ' + Math.round(conf) + '%) 已自动填入，提交前请核对';
+          statusEl.style.color = '#0a7a0a';
+        } else if (clean) {
+          statusEl.textContent = '⚠️ 识别结果: \"' + clean + '\" 不确定，请手动核对或点击图片重试 (置信度 ' + Math.round(conf) + '%)';
+          statusEl.style.color = '#b77900';
+        } else {
+          statusEl.textContent = '⚠️ 未能识别，请手动输入或点击图片刷新后重试';
+          statusEl.style.color = '#b77900';
+        }
+      }
+      if (clean && clean.length >= 3) {
+        input.value = clean;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        // 不自动提交，留给用户确认；若置信度高可聚焦密码框
+        try { input.focus(); } catch (e) {}
+      }
+      return clean;
+    } catch (e) {
+      console.error('[JavDB captcha] recognize failed', e);
+      if (statusEl) {
+        statusEl.textContent = '❌ 识别失败: ' + (e.message || e) + '，请手动输入或点击图片重试';
+        statusEl.style.color = '#d00';
+      }
+    }
+  }
+
+  function setupRuCaptchaAutoInput() {
+    const img = document.querySelector('img.rucaptcha-image');
+    const input = document.querySelector('input.rucaptcha-input, input[name="_rucaptcha"]');
+    if (!img || !input) return;
+    if (img.dataset.captchaAutoBound === '1') return;
+    img.dataset.captchaAutoBound = '1';
+
+    let statusEl = document.getElementById('captcha-auto-status');
+    if (!statusEl) {
+      statusEl = document.createElement('div');
+      statusEl.id = 'captcha-auto-status';
+      statusEl.style.cssText = 'font-size:12px;margin-top:6px;line-height:1.5;color:#666;word-break:break-all;';
+      const p = input.closest('p.control') || input.parentElement;
+      if (p && p.parentElement) {
+        p.parentElement.insertBefore(statusEl, p.nextSibling);
+      } else {
+        input.insertAdjacentElement('afterend', statusEl);
+      }
+      const tip = document.createElement('div');
+      tip.textContent = '提示: 自动识别仅作辅助，提交前请核对；点击图片可刷新验证码';
+      tip.style.cssText = 'font-size:11px;color:#999;margin-top:2px;';
+      statusEl.insertAdjacentElement('afterend', tip);
+    }
+
+    let retryBtn = document.getElementById('captcha-retry-btn');
+    if (!retryBtn) {
+      retryBtn = document.createElement('button');
+      retryBtn.id = 'captcha-retry-btn';
+      retryBtn.type = 'button';
+      retryBtn.textContent = '🔄 重新识别';
+      retryBtn.style.cssText = 'margin-top:6px;font-size:12px;padding:3px 10px;border:1px solid #ccc;border-radius:4px;background:#f5f5f5;cursor:pointer;';
+      retryBtn.addEventListener('click', () => recognizeAndFillCaptcha(img, input, statusEl));
+      statusEl.insertAdjacentElement('afterend', retryBtn);
+    }
+
+    statusEl.textContent = '🤖 检测到图形验证码，准备自动识别...';
+
+    const doOCR = () => setTimeout(() => recognizeAndFillCaptcha(img, input, statusEl), 450);
+
+    if (img.complete && img.naturalWidth > 0) {
+      doOCR();
+    } else {
+      img.addEventListener('load', doOCR, { once: true });
+    }
+
+    img.style.cursor = 'pointer';
+    img.title = '点击刷新验证码';
+
+    img.addEventListener('click', () => {
+      statusEl.textContent = '🔄 已刷新验证码，重新识别中...';
+      statusEl.style.color = '#666';
+      // 图片 src 会被 onclick 换成 /rucaptcha/?t=Date.now()，监听 load
+      const onLoad = () => {
+        img.removeEventListener('load', onLoad);
+        setTimeout(() => recognizeAndFillCaptcha(img, input, statusEl), 500);
+      };
+      img.addEventListener('load', onLoad);
+      // 兜底：若 load 未触发
+      setTimeout(() => {
+        if (statusEl.textContent.includes('重新识别中')) {
+          recognizeAndFillCaptcha(img, input, statusEl);
+        }
+      }, 1500);
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', setupRuCaptchaAutoInput);
+  } else {
+    setupRuCaptchaAutoInput();
+  }
+
+  // 监听 DOM 变化（SPA/刷新后重建）
+  try {
+    new MutationObserver(() => {
+      const img = document.querySelector('img.rucaptcha-image');
+      if (img && img.dataset.captchaAutoBound !== '1') {
+        setupRuCaptchaAutoInput();
+      }
+    }).observe(document.documentElement, { childList: true, subtree: true });
+  } catch (e) {}
+  // ==================== end rucaptcha ====================
+
 
   // 🔒 独立时间戳分布式并发排队锁
   const QUEUE_PREFIX = 'javdb_q_';
