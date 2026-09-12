@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.0
+// @version      5.13.1
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -20,9 +20,11 @@
 // @connect      javdb575.com
 // @connect      app.javdb575.com
 // @connect      cdn.jsdelivr.net
+// @connect      unpkg.com
 // @updateURL    https://raw.githubusercontent.com/lijianbin2/javdb/main/javdb_scraper.user.js
 // @downloadURL  https://raw.githubusercontent.com/lijianbin2/javdb/main/javdb_scraper.user.js
 // @run-at       document-idle
+// @require      https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js
 // @noframes
 // ==/UserScript==
 
@@ -61,20 +63,67 @@
   // ==================== 登录图形验证码自动输入 (rucaptcha) ====================
   // 针对 https://javdb.com/login 的 5位字母图形验证码 /rucaptcha/ 自动OCR填入
   // 使用 Tesseract.js CDN 懒加载，canvas 预处理（放大2倍+灰度二值化），失败可手动重试
+  function getTesseractGlobal() {
+    try { if (typeof Tesseract !== "undefined" && Tesseract) return Tesseract; } catch (e) {}
+    try { if (typeof self !== "undefined" && self.Tesseract) return self.Tesseract; } catch (e) {}
+    try { if (typeof window !== "undefined" && window.Tesseract) return window.Tesseract; } catch (e) {}
+    try { if (typeof globalThis !== "undefined" && globalThis.Tesseract) return globalThis.Tesseract; } catch (e) {}
+    try { if (typeof unsafeWindow !== "undefined" && unsafeWindow.Tesseract) return unsafeWindow.Tesseract; } catch (e) {}
+    return null;
+  }
   let tesseractLoading = null;
-  function ensureTesseract() {
-    if (window.Tesseract) return Promise.resolve(window.Tesseract);
-    if (tesseractLoading) return tesseractLoading;
-    tesseractLoading = new Promise((resolve, reject) => {
-      const s = document.createElement('script');
-      s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
-      s.onload = () => {
-        if (window.Tesseract) resolve(window.Tesseract);
-        else reject(new Error('Tesseract not found after load'));
-      };
-      s.onerror = () => reject(new Error('Tesseract CDN load failed'));
-      document.head.appendChild(s);
+  function loadTesseractViaGM(url) {
+    return new Promise((resolve, reject) => {
+      try {
+        const gm = (typeof GM_xmlhttpRequest === "function" ? GM_xmlhttpRequest : (typeof GM !== "undefined" && GM.xmlHttpRequest ? GM.xmlHttpRequest : null));
+        if (!gm) return reject(new Error("GM_xmlhttpRequest not available"));
+        gm({
+          method: "GET",
+          url: url,
+          onload: res => {
+            try {
+              if (res.status >= 200 && res.status < 300) {
+                (function(){ eval(res.responseText); })();
+                const T = getTesseractGlobal();
+                if (T) resolve(T); else reject(new Error("Tesseract not found after GM eval"));
+              } else reject(new Error("GM fetch status " + res.status));
+            } catch (e) { reject(e); }
+          },
+          onerror: () => reject(new Error("GM fetch failed")),
+          ontimeout: () => reject(new Error("GM fetch timeout"))
+        });
+      } catch (e) { reject(e); }
     });
+  }
+  function loadTesseractViaScriptTag(url) {
+    return new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = url;
+      s.onload = () => {
+        const T = getTesseractGlobal();
+        if (T) resolve(T); else reject(new Error("Tesseract not found after load"));
+      };
+      s.onerror = () => reject(new Error("Tesseract CDN load failed: " + url));
+      (document.head || document.documentElement).appendChild(s);
+    });
+  }
+  function ensureTesseract() {
+    const cached = getTesseractGlobal();
+    if (cached) return Promise.resolve(cached);
+    if (tesseractLoading) return tesseractLoading;
+    const urls = [
+      "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js",
+      "https://unpkg.com/tesseract.js@5.0.4/dist/tesseract.min.js"
+    ];
+    tesseractLoading = (async () => {
+      let lastErr = null;
+      for (const u of urls) {
+        try { return await loadTesseractViaGM(u); } catch (e) { lastErr = e; console.warn("[JavDB captcha] GM load failed " + u, e); }
+        try { return await loadTesseractViaScriptTag(u); } catch (e) { lastErr = e; console.warn("[JavDB captcha] tag load failed " + u, e); }
+      }
+      throw lastErr || new Error("Tesseract load failed");
+    })();
+    tesseractLoading.catch(() => { tesseractLoading = null; });
     return tesseractLoading;
   }
 
