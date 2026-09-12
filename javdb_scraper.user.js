@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.2
+// @version      5.13.3
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -131,16 +131,17 @@
       const scale = opts.scale || 3;
       const threshold = opts.threshold != null ? opts.threshold : 155;
       const doBinarize = opts.binarize !== false;
+      const pad = opts.pad != null ? opts.pad : 10; // 内边距避免边缘字符被裁切(like ayruh 的 a)
       const canvas = document.createElement("canvas");
       const w = img.naturalWidth || 200;
       const h = img.naturalHeight || 70;
-      canvas.width = Math.round(w * scale);
-      canvas.height = Math.round(h * scale);
+      canvas.width = Math.round(w * scale + pad * 2);
+      canvas.height = Math.round(h * scale + pad * 2);
       const ctx = canvas.getContext("2d");
       ctx.imageSmoothingEnabled = false;
       ctx.fillStyle = "#ffffff";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, pad, pad, Math.round(w * scale), Math.round(h * scale));
       try {
         const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
         const d = imageData.data;
@@ -177,11 +178,14 @@
       try {
         const T = await ensureTesseract();
         const variants = [
-          { scale: 3, threshold: 150, binarize: true },
-          { scale: 3, threshold: 128, binarize: true },
-          { scale: 3, threshold: 175, binarize: true },
-          { scale: 2.8, threshold: 155, binarize: true },
-          { scale: 3, binarize: false }
+          { scale: 3, threshold: 150, binarize: true, pad: 10 },
+          { scale: 3, threshold: 135, binarize: true, pad: 10 },
+          { scale: 3, threshold: 115, binarize: true, pad: 10 },
+          { scale: 3, threshold: 128, binarize: true, pad: 10 },
+          { scale: 3, threshold: 175, binarize: true, pad: 10 },
+          { scale: 2.8, threshold: 155, binarize: true, pad: 12 },
+          { scale: 3.2, threshold: 145, binarize: true, pad: 10 },
+          { scale: 3, binarize: false, pad: 10 }
         ];
         let best = { clean: "", conf: 0, raw: "" };
         for (const v of variants) {
@@ -197,12 +201,15 @@
           } catch (e) { console.warn("[JavDB captcha] variant failed", v, e); }
         }
         const clean = best.clean; const conf = best.conf;
+        const shouldAutoFill = clean && clean.length >= 4 && conf >= 30;
+        const uncertainFill = clean && clean.length === 3 && conf >= 50;
         if (statusEl) {
-          if (clean && clean.length >= 4) { statusEl.textContent = "✅ 识别: " + clean + " (置信度 " + Math.round(conf) + "%) 已自动填入，提交前请核对"; statusEl.style.color = "#0a7a0a"; }
+          if (shouldAutoFill || uncertainFill) { statusEl.textContent = "✅ 识别: " + clean + " (置信度 " + Math.round(conf) + "%) 已自动填入，提交前请核对"; statusEl.style.color = "#0a7a0a"; }
+          else if (clean && clean.length >= 4) { statusEl.textContent = "⚠️ 识别: \"" + clean + "\" (置信度 " + Math.round(conf) + "% 偏低，未自动填入，请手动输入或点\"重新识别\" / 点图刷新)"; statusEl.style.color = "#b77900"; }
           else if (clean) { statusEl.textContent = "⚠️ 识别: \"" + clean + "\" 不确定，请手动核对或点图片重试 (置信度 " + Math.round(conf) + "%)"; statusEl.style.color = "#b77900"; }
           else { statusEl.textContent = "⚠️ 未能识别，请手动输入或点击图片刷新后重试"; statusEl.style.color = "#b77900"; }
         }
-        if (clean && clean.length >= 3) { input.value = clean; input.dispatchEvent(new Event("input", { bubbles: true })); input.dispatchEvent(new Event("change", { bubbles: true })); try { input.focus(); } catch (e) {} }
+        if (shouldAutoFill || uncertainFill) { input.value = clean; input.dispatchEvent(new Event("input", { bubbles: true })); input.dispatchEvent(new Event("change", { bubbles: true })); try { input.focus(); } catch (e) {} }
         return clean;
       } catch (e) {
         console.error("[JavDB captcha] recognize failed", e);
