@@ -10,7 +10,7 @@ Tampermonkey 油猴脚本，一键批量提取 JavDB 磁力链接，支持多模
   - 女优/组合：女优名 + 类型/标签 + 页码范围 + 抓取顺序
 - **磁链优选**：优先字幕版（字幕/-C./中文），同组内体积最小，去重后导出迅雷专用 TXT
 - **过滤**：自动跳过 VR 分类、时长 >150分钟、单磁链 >10GB
-- **稳定**：429 限流重试、2秒页内间隔、多标签排队锁（localStorage）
+- **稳定**：429 限流重试、2秒页内间隔、多标签排队锁（GM跨域全局锁）
 - **域名高可用**：
   - 每 6 小时自动从 javdb.com / t.me/s/javdbnews / 官方App 同步最新 javdbNNN.com
   - 双写缓存 GM_*/localStorage，封禁时优先用缓存，实时多源兜底，递减备用列表
@@ -27,7 +27,7 @@ Tampermonkey → 打开以下任一链接 → 安装
 
 本地：`H:\Codex\javdb脚本\javdb_scraper.user.js` 拖入扩展管理
 
-脚本头已配置 @updateURL / @downloadURL，Tampermonkey 会自动检测更新（当前 v5.13.6）。
+脚本头已配置 @updateURL / @downloadURL，Tampermonkey 会自动检测更新（当前 v5.13.7）。
 
 ## 使用
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.6
+// @version      5.13.7
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -63,7 +63,7 @@
   const QUEUE_PREFIX = 'javdb_q_';
   const LOCK_KEY = 'javdb_scraper_active_tab';
   const LOCK_TIME_KEY = LOCK_KEY + '_time';
-  const LOCK_EXPIRY_MS = 20000; // 超过这个时间视为锁失效（20s）
+  const LOCK_EXPIRY_MS = 45000; // 超过这个时间视为锁失效（45s）
   const TAB_ID = Math.random().toString(36).substring(2, 9);
   const MY_Q_KEY = QUEUE_PREFIX + TAB_ID;
 
@@ -82,16 +82,16 @@
     try {
       localStorage.removeItem(MY_Q_KEY);
       localStorage.removeItem(MY_Q_KEY + '_time');
-      if (localStorage.getItem(LOCK_KEY) === TAB_ID) {
-        localStorage.removeItem(LOCK_KEY);
-        localStorage.removeItem(LOCK_TIME_KEY);
+      if (lockStoreGet(LOCK_KEY) === TAB_ID) {
+        lockStoreDel(LOCK_KEY);
+        lockStoreDel(LOCK_TIME_KEY);
       }
     } catch (e) {}
   }
 
   function isLockExpired() {
     try {
-      const t = parseInt(localStorage.getItem(LOCK_TIME_KEY) || '0', 10);
+      const t = parseInt(lockStoreGet(LOCK_TIME_KEY) || '0', 10);
       if (!t) return true;
       return (Date.now() - t) > LOCK_EXPIRY_MS;
     } catch (e) {
@@ -144,11 +144,11 @@
       }
 
       // 如果已有锁但超过过期时间，则回收它
-      const currentLock = localStorage.getItem(LOCK_KEY);
+      const currentLock = lockStoreGet(LOCK_KEY);
       if (currentLock && currentLock !== TAB_ID && isLockExpired()) {
         try {
-          localStorage.removeItem(LOCK_KEY);
-          localStorage.removeItem(LOCK_TIME_KEY);
+          lockStoreDel(LOCK_KEY);
+          lockStoreDel(LOCK_TIME_KEY);
           if (logEl) {
             logEl.innerHTML += `🔧 发现过期锁（${escapeHtml(currentLock)}），已回收。<br>`;
             logEl.scrollTop = logEl.scrollHeight;
@@ -160,13 +160,16 @@
 
       if (pos === 1) {
         try {
-          localStorage.setItem(LOCK_KEY, TAB_ID);
-          localStorage.setItem(LOCK_TIME_KEY, Date.now().toString());
+          const holder = lockStoreGet(LOCK_KEY);
+          if (!holder || holder === TAB_ID || isLockExpired()) {
+            lockStoreSet(LOCK_KEY, TAB_ID);
+            lockStoreSet(LOCK_TIME_KEY, Date.now().toString());
+          }
         } catch (e) {}
 
         await sleep(100);
 
-        if (localStorage.getItem(LOCK_KEY) === TAB_ID) return true;
+        if (lockStoreGet(LOCK_KEY) === TAB_ID) return true;
       }
 
       const aheadCount = pos - 1;
@@ -185,10 +188,12 @@
   function updateLockHeartbeat() {
     registerInQueue();
     try {
-      if (localStorage.getItem(LOCK_KEY) === TAB_ID) {
-        localStorage.setItem(LOCK_TIME_KEY, Date.now().toString());
+      if (lockStoreGet(LOCK_KEY) === TAB_ID) {
+        lockStoreSet(LOCK_TIME_KEY, Date.now().toString());
+        return true;
       }
     } catch (e) {}
+    return false;
   }
 
   window.addEventListener('beforeunload', (e) => {
@@ -260,6 +265,30 @@
   function gmSetValueCompat(key, val) {
     try { if (typeof GM_setValue !== 'undefined') GM_setValue(key, val); } catch (e) {}
     try { localStorage.setItem(key, String(val)); } catch (e) {}
+  }
+
+  // GM cross-domain global lock store (shared across javdb mirror domains).
+  // GM values are script-level and visible on all origins; localStorage is the same-origin fallback.
+  function lockStoreGet(key) {
+    try {
+      if (typeof GM_getValue !== 'undefined') {
+        const v = GM_getValue(key, null);
+        if (v !== undefined && v !== null && v !== '') return String(v);
+      }
+    } catch (e) {}
+    try {
+      const ls = localStorage.getItem(key);
+      if (ls !== null && ls !== '') return ls;
+    } catch (e) {}
+    return null;
+  }
+  function lockStoreSet(key, val) {
+    try { if (typeof GM_setValue !== 'undefined') GM_setValue(key, String(val)); } catch (e) {}
+    try { localStorage.setItem(key, String(val)); } catch (e) {}
+  }
+  function lockStoreDel(key) {
+    try { if (typeof GM_setValue !== 'undefined') GM_setValue(key, ''); } catch (e) {}
+    try { localStorage.removeItem(key); } catch (e) {}
   }
 
   function gmGet(url) {
@@ -691,7 +720,7 @@ btnGotoCode.addEventListener('click', () => {
       if (attempt < 3) {
         const delay = Math.min(3000 * Math.pow(2, attempt), 30000) + getRandomDelay(0, 1000);
         log(`⚠️ ${label}${lastStatus === 429 ? '触发限流' : '网络错误'}，约 ${Math.round(delay / 1000)} 秒后重试 (${attempt + 1}/3)...`);
-        await sleep(delay);
+        { const __t0 = Date.now(); let __left = delay; while (__left > 0) { if (shouldStop) return null; const __step = Math.min(5000, __left); await sleep(__step); updateLockHeartbeat(); __left = delay - (Date.now() - __t0); } }
       }
     }
     log(`⚠️ ${label}重试 3 次仍失败，已跳过`);
@@ -882,9 +911,21 @@ btnGotoCode.addEventListener('click', () => {
     let lastItemStartedAt = 0;
 
     async function waitForNextItemSlot() {
+      if (shouldStop) return false;
+      if (lastItemStartedAt) {
+        try {
+          if (lockStoreGet(LOCK_KEY) !== TAB_ID) {
+            log('丢失排队锁，重新排队等待中...');
+            const ok = await acquireLock();
+            if (!ok || shouldStop) return false;
+            lastItemStartedAt = Date.now();
+            return true;
+          }
+        } catch (e) {}
+      }
       if (!lastItemStartedAt) {
         lastItemStartedAt = Date.now();
-        return;
+        return true;
       }
 
       const elapsed = Date.now() - lastItemStartedAt;
@@ -894,6 +935,7 @@ btnGotoCode.addEventListener('click', () => {
         await sleep(waitMs);
       }
       lastItemStartedAt = Date.now();
+      return true;
     }
 
 
@@ -945,7 +987,7 @@ btnGotoCode.addEventListener('click', () => {
 
                 for (let idx = 0; idx < items.length; idx++) {
                   if (shouldStop) break;
-                  await waitForNextItemSlot();
+                  if (!(await waitForNextItemSlot())) break;
                   const item = items[idx];
                   const aTag = item.querySelector('a');
                   if (!aTag) continue;
@@ -992,7 +1034,7 @@ btnGotoCode.addEventListener('click', () => {
         let domainJumped = false;
         for (let i = startNum; i <= endNum; i++) {
           if (shouldStop || domainJumped) break;
-          await waitForNextItemSlot();
+          if (!(await waitForNextItemSlot())) break;
 
           const rawNumStr = String(i);
           const pad3Str = rawNumStr.padStart(3, '0');
@@ -1212,7 +1254,7 @@ btnGotoCode.addEventListener('click', () => {
 
             for (let idx = 0; idx < movieItems.length; idx++) {
               if (shouldStop) break;
-              await waitForNextItemSlot();
+              if (!(await waitForNextItemSlot())) break;
               const item = movieItems[idx];
               const aTag = item.querySelector('a');
               if (!aTag) continue;
