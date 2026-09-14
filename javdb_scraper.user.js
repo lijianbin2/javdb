@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.4
+// @version      5.13.5
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -19,12 +19,9 @@
 // @connect      javdb.com
 // @connect      javdb575.com
 // @connect      app.javdb575.com
-// @connect      cdn.jsdelivr.net
-// @connect      unpkg.com
 // @updateURL    https://raw.githubusercontent.com/lijianbin2/javdb/main/javdb_scraper.user.js
 // @downloadURL  https://raw.githubusercontent.com/lijianbin2/javdb/main/javdb_scraper.user.js
 // @run-at       document-idle
-// @require      https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js
 // @noframes
 // ==/UserScript==
 
@@ -60,245 +57,6 @@
     autoCheckRememberMe();
   }
 
-  // ==================== 登录图形验证码自动输入 (rucaptcha) ====================
-  // 针对 https://javdb.com/login 的 5位字母图形验证码 /rucaptcha/ 自动OCR填入
-  // 使用 Tesseract.js CDN 懒加载，canvas 预处理（放大2倍+灰度二值化），失败可手动重试
-  function getTesseractGlobal() {
-    try { if (typeof Tesseract !== "undefined" && Tesseract) return Tesseract; } catch (e) {}
-    try { if (typeof self !== "undefined" && self.Tesseract) return self.Tesseract; } catch (e) {}
-    try { if (typeof window !== "undefined" && window.Tesseract) return window.Tesseract; } catch (e) {}
-    try { if (typeof globalThis !== "undefined" && globalThis.Tesseract) return globalThis.Tesseract; } catch (e) {}
-    try { if (typeof unsafeWindow !== "undefined" && unsafeWindow.Tesseract) return unsafeWindow.Tesseract; } catch (e) {}
-    return null;
-  }
-  let tesseractLoading = null;
-  function loadTesseractViaGM(url) {
-    return new Promise((resolve, reject) => {
-      try {
-        const gm = (typeof GM_xmlhttpRequest === "function" ? GM_xmlhttpRequest : (typeof GM !== "undefined" && GM.xmlHttpRequest ? GM.xmlHttpRequest : null));
-        if (!gm) return reject(new Error("GM_xmlhttpRequest not available"));
-        gm({
-          method: "GET",
-          url: url,
-          onload: res => {
-            try {
-              if (res.status >= 200 && res.status < 300) {
-                (function(){ eval(res.responseText); })();
-                const T = getTesseractGlobal();
-                if (T) resolve(T); else reject(new Error("Tesseract not found after GM eval"));
-              } else reject(new Error("GM fetch status " + res.status));
-            } catch (e) { reject(e); }
-          },
-          onerror: () => reject(new Error("GM fetch failed")),
-          ontimeout: () => reject(new Error("GM fetch timeout"))
-        });
-      } catch (e) { reject(e); }
-    });
-  }
-  function loadTesseractViaScriptTag(url) {
-    return new Promise((resolve, reject) => {
-      const s = document.createElement("script");
-      s.src = url;
-      s.onload = () => {
-        const T = getTesseractGlobal();
-        if (T) resolve(T); else reject(new Error("Tesseract not found after load"));
-      };
-      s.onerror = () => reject(new Error("Tesseract CDN load failed: " + url));
-      (document.head || document.documentElement).appendChild(s);
-    });
-  }
-  function ensureTesseract() {
-    const cached = getTesseractGlobal();
-    if (cached) return Promise.resolve(cached);
-    if (tesseractLoading) return tesseractLoading;
-    const urls = [
-      "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js",
-      "https://unpkg.com/tesseract.js@5.0.4/dist/tesseract.min.js"
-    ];
-    tesseractLoading = (async () => {
-      let lastErr = null;
-      for (const u of urls) {
-        try { return await loadTesseractViaGM(u); } catch (e) { lastErr = e; console.warn("[JavDB captcha] GM load failed " + u, e); }
-        try { return await loadTesseractViaScriptTag(u); } catch (e) { lastErr = e; console.warn("[JavDB captcha] tag load failed " + u, e); }
-      }
-      throw lastErr || new Error("Tesseract load failed");
-    })();
-    tesseractLoading.catch(() => { tesseractLoading = null; });
-    return tesseractLoading;
-  }
-
-  function preprocessImageToCanvas(img, opts = {}) {
-      const scale = opts.scale || 3;
-      const threshold = opts.threshold != null ? opts.threshold : 155;
-      const doBinarize = opts.binarize !== false;
-      const pad = opts.pad != null ? opts.pad : 10; // 内边距避免边缘字符被裁切(like ayruh 的 a)
-      const canvas = document.createElement("canvas");
-      const w = img.naturalWidth || 200;
-      const h = img.naturalHeight || 70;
-      canvas.width = Math.round(w * scale + pad * 2);
-      canvas.height = Math.round(h * scale + pad * 2);
-      const ctx = canvas.getContext("2d");
-      ctx.imageSmoothingEnabled = false;
-      ctx.fillStyle = "#ffffff";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(img, pad, pad, Math.round(w * scale), Math.round(h * scale));
-      try {
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const d = imageData.data;
-        let min = 255, max = 0;
-        const grays = new Uint8Array(canvas.width * canvas.height);
-        for (let i = 0, j = 0; i < d.length; i += 4, j++) {
-          const g = 0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2];
-          grays[j] = g;
-          if (g < min) min = g;
-          if (g > max) max = g;
-        }
-        const range = max - min || 1;
-        for (let i = 0, j = 0; i < d.length; i += 4, j++) {
-          let g = (grays[j] - min) * 255 / range;
-          if (doBinarize) {
-            const bw = g > threshold ? 255 : 0;
-            d[i] = d[i+1] = d[i+2] = bw;
-          } else {
-            g = Math.max(0, Math.min(255, g));
-            d[i] = d[i+1] = d[i+2] = g;
-          }
-          d[i+3] = 255;
-        }
-        ctx.putImageData(imageData, 0, 0);
-      } catch (e) {
-        console.warn("[JavDB captcha] canvas preprocess failed", e);
-      }
-      return canvas;
-    }
-
-  async function recognizeAndFillCaptcha(img, input, statusEl) {
-      if (!img || !input) return;
-      if (statusEl) { statusEl.textContent = "⏳ 正在识别验证码..."; statusEl.style.color = "#666"; }
-      try {
-        const T = await ensureTesseract();
-        const variants = [
-          { scale: 3, threshold: 150, binarize: true, pad: 10 },
-          { scale: 3, threshold: 135, binarize: true, pad: 10 },
-          { scale: 3, threshold: 115, binarize: true, pad: 10 },
-          { scale: 3, threshold: 128, binarize: true, pad: 10 },
-          { scale: 3, threshold: 175, binarize: true, pad: 10 },
-          { scale: 2.8, threshold: 155, binarize: true, pad: 12 },
-          { scale: 3.2, threshold: 145, binarize: true, pad: 10 },
-          { scale: 3, binarize: false, pad: 10 }
-        ];
-        let best = { clean: "", conf: 0, raw: "" };
-        for (const v of variants) {
-          try {
-            const canvas = preprocessImageToCanvas(img, v);
-            const result = await T.recognize(canvas, "eng", { tessedit_char_whitelist: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", tessedit_pageseg_mode: "7" });
-            const raw = (result && result.data && result.data.text) ? result.data.text : "";
-            const conf = (result && result.data && typeof result.data.confidence === "number") ? result.data.confidence : 0;
-            let clean = raw.replace(/[^a-zA-Z]/g, "").trim().slice(0, 5).toLowerCase();
-            if (clean.length > best.clean.length || (clean.length === best.clean.length && conf > best.conf)) best = { clean, conf, raw };
-            if (best.clean.length >= 5 && best.conf > 65) break;
-            if (best.clean.length >= 4 && best.conf > 75) break;
-          } catch (e) { console.warn("[JavDB captcha] variant failed", v, e); }
-        }
-        const clean = best.clean; const conf = best.conf;
-        const shouldAutoFill = clean && clean.length >= 4 && conf >= 30;
-        const uncertainFill = clean && clean.length === 3 && conf >= 50;
-        if (statusEl) {
-          if (shouldAutoFill || uncertainFill) { statusEl.textContent = "✅ 识别: " + clean + " (置信度 " + Math.round(conf) + "%) 已自动填入，提交前请核对"; statusEl.style.color = "#0a7a0a"; }
-          else if (clean && clean.length >= 4) { statusEl.textContent = "⚠️ 识别: \"" + clean + "\" (置信度 " + Math.round(conf) + "% 偏低，未自动填入，请手动输入或点\"重新识别\" / 点图刷新)"; statusEl.style.color = "#b77900"; }
-          else if (clean) { statusEl.textContent = "⚠️ 识别: \"" + clean + "\" 不确定，请手动核对或点图片重试 (置信度 " + Math.round(conf) + "%)"; statusEl.style.color = "#b77900"; }
-          else { statusEl.textContent = "⚠️ 未能识别，请手动输入或点击图片刷新后重试"; statusEl.style.color = "#b77900"; }
-        }
-        if (shouldAutoFill || uncertainFill) { input.value = clean; input.dispatchEvent(new Event("input", { bubbles: true })); input.dispatchEvent(new Event("change", { bubbles: true })); try { input.focus(); } catch (e) {} }
-        return clean;
-      } catch (e) {
-        console.error("[JavDB captcha] recognize failed", e);
-        if (statusEl) { statusEl.textContent = "❌ 识别失败: " + (e.message || e) + "，请手动输入或点图片重试"; statusEl.style.color = "#d00"; }
-      }
-    }
-
-  function setupRuCaptchaAutoInput() {
-    const img = document.querySelector('img.rucaptcha-image');
-    const input = document.querySelector('input.rucaptcha-input, input[name="_rucaptcha"]');
-    if (!img || !input) return;
-    if (img.dataset.captchaAutoBound === '1') return;
-    img.dataset.captchaAutoBound = '1';
-
-    let statusEl = document.getElementById('captcha-auto-status');
-    if (!statusEl) {
-      statusEl = document.createElement('div');
-      statusEl.id = 'captcha-auto-status';
-      statusEl.style.cssText = 'font-size:12px;margin-top:6px;line-height:1.5;color:#666;word-break:break-all;';
-      const p = input.closest('p.control') || input.parentElement;
-      if (p && p.parentElement) {
-        p.parentElement.insertBefore(statusEl, p.nextSibling);
-      } else {
-        input.insertAdjacentElement('afterend', statusEl);
-      }
-      const tip = document.createElement('div');
-      tip.textContent = '提示: 自动识别仅作辅助，提交前请核对；点击图片可刷新验证码';
-      tip.style.cssText = 'font-size:11px;color:#999;margin-top:2px;';
-      statusEl.insertAdjacentElement('afterend', tip);
-    }
-
-    let retryBtn = document.getElementById('captcha-retry-btn');
-    if (!retryBtn) {
-      retryBtn = document.createElement('button');
-      retryBtn.id = 'captcha-retry-btn';
-      retryBtn.type = 'button';
-      retryBtn.textContent = '🔄 重新识别';
-      retryBtn.style.cssText = 'margin-top:6px;font-size:12px;padding:3px 10px;border:1px solid #ccc;border-radius:4px;background:#f5f5f5;cursor:pointer;';
-      retryBtn.addEventListener('click', () => recognizeAndFillCaptcha(img, input, statusEl));
-      statusEl.insertAdjacentElement('afterend', retryBtn);
-    }
-
-    statusEl.textContent = '🤖 检测到图形验证码，准备自动识别...';
-
-    const doOCR = () => setTimeout(() => recognizeAndFillCaptcha(img, input, statusEl), 450);
-
-    if (img.complete && img.naturalWidth > 0) {
-      doOCR();
-    } else {
-      img.addEventListener('load', doOCR, { once: true });
-    }
-
-    img.style.cursor = 'pointer';
-    img.title = '点击刷新验证码';
-
-    img.addEventListener('click', () => {
-      statusEl.textContent = '🔄 已刷新验证码，重新识别中...';
-      statusEl.style.color = '#666';
-      // 图片 src 会被 onclick 换成 /rucaptcha/?t=Date.now()，监听 load
-      const onLoad = () => {
-        img.removeEventListener('load', onLoad);
-        setTimeout(() => recognizeAndFillCaptcha(img, input, statusEl), 500);
-      };
-      img.addEventListener('load', onLoad);
-      // 兜底：若 load 未触发
-      setTimeout(() => {
-        if (statusEl.textContent.includes('重新识别中')) {
-          recognizeAndFillCaptcha(img, input, statusEl);
-        }
-      }, 1500);
-    });
-  }
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', setupRuCaptchaAutoInput);
-  } else {
-    setupRuCaptchaAutoInput();
-  }
-
-  // 监听 DOM 变化（SPA/刷新后重建）
-  try {
-    new MutationObserver(() => {
-      const img = document.querySelector('img.rucaptcha-image');
-      if (img && img.dataset.captchaAutoBound !== '1') {
-        setupRuCaptchaAutoInput();
-      }
-    }).observe(document.documentElement, { childList: true, subtree: true });
-  } catch (e) {}
-  // ==================== end rucaptcha ====================
 
 
   // 🔒 独立时间戳分布式并发排队锁
@@ -1510,4 +1268,3 @@
     input.addEventListener('keydown', handleEnterKey);
   });
 })();
-
