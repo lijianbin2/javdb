@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.5
+// @version      5.13.6
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -549,7 +549,10 @@
     <div id="section-code" style="display: none; flex-direction: column; gap: 6px; margin-bottom: 10px; font-size: 12px;">
       <div style="display: flex; align-items: center; justify-content: space-between;">
         <label for="scraper-prefix">番号前缀:</label>
-        <input id="scraper-prefix" type="text" value="" style="width: 110px; background: #333; color: #fff; border: 1px solid #555; padding: 2px 5px; border-radius: 3px;">
+        <div style="display: flex; gap: 4px; align-items: center;">
+                  <input id="scraper-prefix" type="text" value="" style="width: 72px; background: #333; color: #fff; border: 1px solid #555; padding: 2px 5px; border-radius: 3px;">
+          <button id="btn-goto-code" title="打开番号前缀页（新标签页）" style="padding: 2px 8px; background: #17a2b8; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 12px;">跳转</button>
+        </div>
       </div>
       <div style="display: flex; align-items: center; justify-content: space-between;">
         <label>数字范围:</label>
@@ -646,6 +649,13 @@
   const logEl = document.getElementById('scraper-log');
   const btnStart = document.getElementById('btn-start');
   const btnStop = document.getElementById('btn-stop');
+const btnGotoCode = document.getElementById('btn-goto-code');
+btnGotoCode.addEventListener('click', () => {
+  const prefix = (document.getElementById('scraper-prefix').value || '').trim().toUpperCase();
+  if (!prefix) { alert('请先填写番号前缀'); return; }
+  window.open(`${location.origin}/video_codes/${encodeURIComponent(prefix)}`, '_blank');
+});
+
 
   function log(msg) {
     const time = new Date().toLocaleTimeString();
