@@ -1,24 +1,29 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.7
+// @version      5.13.65
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
+// @match        *://javdb.com/*
+// @match        *://*.javdb.com/*
 // @match        *://*.javdb575.com/*
 // @match        *://javdb575.com/*
-// @match        *://*.javdb*.*/*
-// @match        *://javdb*.*/*
 // @include      /^https?:\/\/(www\.)?javdb\d*\.(com|org|net)\/.*$/
 // @grant        GM_xmlhttpRequest
 // @grant        GM.xmlHttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
+// @grant        GM.getValue
+// @grant        GM.setValue
+// @grant        GM.registerMenuCommand
 // @connect      t.me
 // @connect      javdb.com
 // @connect      javdb575.com
-// @connect      app.javdb575.com
+// @connect      app.javdb.com
+// Dynamic app.javdbNNN.com has no partial-wildcard support and cannot be enumerated, keep * (see fetchLatestDomainFromApp).
+// @connect      *
 // @updateURL    https://raw.githubusercontent.com/lijianbin2/javdb/main/javdb_scraper.user.js
 // @downloadURL  https://raw.githubusercontent.com/lijianbin2/javdb/main/javdb_scraper.user.js
 // @run-at       document-idle
@@ -28,36 +33,70 @@
 (function () {
   'use strict';
 
+  const SCRIPT_VERSION = '5.13.65';
+  function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+  function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+
   const origTitle = document.title;
 
   let isRunning = false;
   let shouldStop = false;
+  let isJumping = false;
+  let loginStopped = false;
+  let tagFailed = false;
+  let banStopped = false;
   let currentMode = 'current';
-  let fetchedCount = 0;
   const ITEM_INTERVAL_MS = 2000;
 
   function autoCheckRememberMe() {
-    const checkboxes = document.querySelectorAll('input[type="checkbox"]');
-    checkboxes.forEach(cb => {
-      const parentText = cb.closest('label')?.textContent || cb.parentElement?.textContent || '';
-      if (
-        parentText.includes('七天') ||
-        parentText.includes('保持') ||
-        cb.name?.includes('remember') ||
-        cb.id?.includes('remember')
-      ) {
-        if (!cb.checked) cb.checked = true;
-      }
+    var boxes = null;
+    try { boxes = document.querySelectorAll("input[type=checkbox]"); } catch(e) { return 0; }
+    if (!boxes || !boxes.length) { return 0; }
+    var n = 0;
+    boxes.forEach(function(cb) {
+      try {
+        if (cb.checked) { return; }
+        var t = "";
+        try { t = (cb.getAttribute("value") || "") + " " + (cb.name || "") + " " + (cb.id || ""); } catch(e0) {}
+        var lb = "";
+        try { lb = cb.closest("label").textContent || ""; } catch(e1) {}
+        if (!lb) { try { lb = cb.parentElement.textContent || ""; if (lb.length > 60) { lb = ""; } } catch(e2) {} }
+        t = t + " " + lb;
+        var low = "";
+        try { low = t.toLowerCase(); } catch(e3) { low = t; }
+        var isRm = false;
+        if (low.indexOf("remember") >= 0) { isRm = true; }
+        if (t.indexOf("记住") >= 0) { isRm = true; }
+        if (t.indexOf("保持") >= 0) { isRm = true; }
+        if (t.indexOf("七天") >= 0) { isRm = true; }
+        if (t.indexOf("免登") >= 0) { isRm = true; }
+        if (t.indexOf("自动登录") >= 0) { isRm = true; }
+        if (!isRm) { return; }
+        try { cb.checked = true; } catch(e4) {}
+        try { cb.dispatchEvent(new Event("input", { bubbles: true })); } catch(e5) {}
+        try { cb.dispatchEvent(new Event("change", { bubbles: true })); } catch(e6) {}
+        n++;
+      } catch(e7) {}
     });
+    return n;
   }
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', autoCheckRememberMe);
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", autoCheckRememberMe);
   } else {
-    autoCheckRememberMe();
+    try { autoCheckRememberMe(); } catch(e8) {}
   }
-
-
+  try {
+    var rmbTs = 0;
+    var rmbObs = new MutationObserver(function() {
+      var now = Date.now();
+      if (now - rmbTs < 1500) { return; }
+      rmbTs = now;
+      if (isRunning) { return; }
+      try { autoCheckRememberMe(); } catch(e9) {}
+    });
+    rmbObs.observe(document.documentElement, { childList: true, subtree: true });
+  } catch(e10) {}
+  try { setInterval(function() { if (isRunning) { return; } try { autoCheckRememberMe(); } catch(e11) {} }, 2000); } catch(e12) {}
 
   // 🔒 独立时间戳分布式并发排队锁
   const QUEUE_PREFIX = 'javdb_q_';
@@ -67,12 +106,21 @@
   const TAB_ID = Math.random().toString(36).substring(2, 9);
   const MY_Q_KEY = QUEUE_PREFIX + TAB_ID;
 
+  let lastRegWrite = 0;
   function registerInQueue() {
     try {
+      const nowMs = Date.now();
       if (!localStorage.getItem(MY_Q_KEY)) {
-        localStorage.setItem(MY_Q_KEY, Date.now().toString());
+        localStorage.setItem(MY_Q_KEY, nowMs.toString());
+        localStorage.setItem(MY_Q_KEY + "_time", nowMs.toString());
+        lastRegWrite = nowMs;
+        return;
       }
-      localStorage.setItem(MY_Q_KEY + '_time', Date.now().toString());
+      if (nowMs - lastRegWrite < 5000) {
+        return;
+      }
+      localStorage.setItem(MY_Q_KEY + "_time", nowMs.toString());
+      lastRegWrite = nowMs;
     } catch (e) {
       // ignore storage errors
     }
@@ -99,9 +147,11 @@
     }
   }
 
+  let lastQueueSweep = 0;
   function getQueuePosition() {
     registerInQueue();
     const now = Date.now();
+    const doSweep = now - lastQueueSweep > 10000;
     const entries = [];
 
     const keys = [];
@@ -112,21 +162,24 @@
 
     for (const key of keys) {
       if (key.endsWith('_time')) continue;
-      const id = key.replace(QUEUE_PREFIX, '');
+      const id = key.slice(QUEUE_PREFIX.length);
       const lastTime = parseInt(localStorage.getItem(key + '_time') || '0', 10);
 
       if (now - lastTime < 12000) {
         const regTime = parseInt(localStorage.getItem(key) || '0', 10);
         entries.push({ id, regTime });
       } else {
+        if (doSweep) {
         // 清理过期队列项
-        try {
-          localStorage.removeItem(key);
-          localStorage.removeItem(key + '_time');
-        } catch (e) {}
+          try {
+            localStorage.removeItem(key);
+            localStorage.removeItem(key + '_time');
+          } catch (e) {}
+        }
       }
     }
 
+    if (doSweep) { lastQueueSweep = now; }
     entries.sort((a, b) => a.regTime - b.regTime);
     const myIdx = entries.findIndex(e => e.id === TAB_ID);
     if (myIdx === -1) return { pos: 1, total: entries.length + 1 };
@@ -136,10 +189,16 @@
   async function acquireLock() {
     const statusEl = document.getElementById('scraper-status');
     const logEl = document.getElementById('scraper-log');
+    let queueWaitLogged = false;
+    let lastPos = 0;
 
     while (true) {
       if (shouldStop) {
         removeFromQueue();
+        return false;
+      }
+      if (isFreshBanForCurrentHost()) {
+        try { removeFromQueue(); } catch (e) {}
         return false;
       }
 
@@ -173,23 +232,33 @@
       }
 
       const aheadCount = pos - 1;
-      if (statusEl) statusEl.innerText = `⏳ 排队中 (前面还有 ${aheadCount} 个任务)...`;
-      document.title = `⏳[排队第${pos}位] ${origTitle}`;
+      if (pos !== lastPos) {
+        if (statusEl) statusEl.innerText = `⏳ 排队中 (前面还有 ${aheadCount} 个任务)...`;
+        document.title = `⏳[排队第${pos}位] ${origTitle}`;
+        lastPos = pos;
+      }
 
-      if (logEl && !logEl.innerText.includes('排队等待')) {
+      if (logEl && !queueWaitLogged) {
+        queueWaitLogged = true;
         logEl.innerHTML += `⏳ 前方有 ${aheadCount} 个任务正在抓取，排队等待中...<br>`;
         logEl.scrollTop = logEl.scrollHeight;
       }
 
-      await sleep(1500);
+      await sleep(pos > 3 ? 4000 : 1500);
     }
   }
 
+  let lastBeatWrite = 0;
   function updateLockHeartbeat() {
     registerInQueue();
     try {
       if (lockStoreGet(LOCK_KEY) === TAB_ID) {
-        lockStoreSet(LOCK_TIME_KEY, Date.now().toString());
+        var nowB = Date.now();
+        if (nowB - lastBeatWrite < 5000) {
+          return true;
+        }
+        lastBeatWrite = nowB;
+        lockStoreSet(LOCK_TIME_KEY, nowB.toString());
         return true;
       }
     } catch (e) {}
@@ -197,7 +266,7 @@
   }
 
   window.addEventListener('beforeunload', (e) => {
-    if (isRunning) {
+    if (isRunning && !isJumping) {
       e.preventDefault();
       e.returnValue = '';
     }
@@ -218,7 +287,26 @@
   const DOMAIN_CACHE_TIME_KEY = 'javdb_latest_domain_time';
   const DOMAIN_CACHE_SOURCE_KEY = 'javdb_latest_domain_source';
   const DOMAIN_AUTO_UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6小时
-  let domainAutoTimer = null;
+  let domainAutoTimer = window.__javdbScraperTimer || null;
+  if (domainAutoTimer) { try { clearInterval(domainAutoTimer); } catch (e) {} }
+
+  function isLoginPage(url, html) {
+    try {
+      if (url && /\/login(\?|$)/.test(String(url))) return true;
+    } catch (e) {}
+    try {
+      const head = String(html || "").slice(0, 20000);
+      if (/type=\s*['"]password['"]/i.test(head)) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  function handleLoginRedirect(url, html, label) {
+    if (!isLoginPage(url, html)) return false;
+    try { log('[!] ' + label + ' 即将跳转登录页，请先登录 JavDB 后再执行'); } catch (e) {}
+    try { shouldStop = true; loginStopped = true; statusEl.innerText = '状态: 请先登录 JavDB 后再抓取'; } catch (e) {}
+    return true;
+  }
 
   function isBannedPage(status, textStr) {
     if (status === 403) return true;
@@ -246,6 +334,8 @@
   }
 
   // —— GM 存储兼容层（GM + localStorage 双写）——
+  // Memory cache for async-only GM stores (filled by prefetch below).
+  var __asyncGmCache = {};
   function gmGetValueCompat(key, defVal) {
     try {
       if (typeof GM_getValue !== 'undefined') {
@@ -257,6 +347,9 @@
       }
     } catch (e) {}
     try {
+      if (Object.prototype.hasOwnProperty.call(__asyncGmCache, key)) return __asyncGmCache[key];
+    } catch (e) {}
+    try {
       const ls = localStorage.getItem(key);
       if (ls !== null) return ls;
     } catch (e) {}
@@ -264,6 +357,7 @@
   }
   function gmSetValueCompat(key, val) {
     try { if (typeof GM_setValue !== 'undefined') GM_setValue(key, val); } catch (e) {}
+    try { __asyncGmCache[key] = String(val); } catch (e) {}
     try { localStorage.setItem(key, String(val)); } catch (e) {}
   }
 
@@ -277,6 +371,12 @@
       }
     } catch (e) {}
     try {
+      if (Object.prototype.hasOwnProperty.call(__asyncGmCache, key)) {
+        const cv = __asyncGmCache[key];
+        if (cv !== undefined && cv !== null && cv !== '') return String(cv);
+      }
+    } catch (e) {}
+    try {
       const ls = localStorage.getItem(key);
       if (ls !== null && ls !== '') return ls;
     } catch (e) {}
@@ -284,19 +384,71 @@
   }
   function lockStoreSet(key, val) {
     try { if (typeof GM_setValue !== 'undefined') GM_setValue(key, String(val)); } catch (e) {}
+    try { __asyncGmCache[key] = String(val); } catch (e) {}
     try { localStorage.setItem(key, String(val)); } catch (e) {}
   }
   function lockStoreDel(key) {
     try { if (typeof GM_setValue !== 'undefined') GM_setValue(key, ''); } catch (e) {}
+    try { delete __asyncGmCache[key]; } catch (e) {}
     try { localStorage.removeItem(key); } catch (e) {}
   }
+  const BAN_HOST_KEY = "javdb_ban_host";
+  const BAN_TIME_KEY = "javdb_ban_time";
+  const BAN_TTL_MS = 90000;
+  // Async-GM prefetch (MV3/Violentmonkey): sync GM_getValue may be absent while
+  // promise-based GM.getValue exists. Mirror the small known key set into
+  // __asyncGmCache once so the sync getters above keep working cross-origin.
+  try {
+    var __asyncGet = (typeof GM !== 'undefined' && GM && GM.getValue) ? GM.getValue : null;
+    if (__asyncGet && typeof GM_getValue === 'undefined') {
+      (function (getFn, keyList) {
+        keyList.forEach(function (k) {
+          try {
+            var p = getFn.call(GM, k, null);
+            if (p && typeof p.then === 'function') {
+              p.then(function (v) {
+                try { if (v !== undefined && v !== null) __asyncGmCache[k] = String(v); } catch (e2) {}
+              }, function () {});
+            } else if (p !== undefined && p !== null) {
+              __asyncGmCache[k] = String(p);
+            }
+          } catch (e) {}
+        });
+      })(__asyncGet, [LOCK_KEY, LOCK_TIME_KEY, DOMAIN_CACHE_KEY, DOMAIN_CACHE_TIME_KEY, DOMAIN_CACHE_SOURCE_KEY, BAN_HOST_KEY, BAN_TIME_KEY]);
+    }
+  } catch (e) {}
+  function broadcastBanForCurrentHost() {
+    try {
+      var h = "";
+      try { h = window.location.hostname.toLowerCase(); } catch (e) {}
+      if (!h) return;
+      lockStoreSet(BAN_HOST_KEY, h);
+      lockStoreSet(BAN_TIME_KEY, String(Date.now()));
+    } catch (e) {}
+  }
+  function isFreshBanForCurrentHost() {
+    try {
+      var b = lockStoreGet(BAN_HOST_KEY);
+      if (!b) return false;
+      var cur = "";
+      try { cur = window.location.hostname.toLowerCase(); } catch (e) {}
+      if (!cur || b !== cur) return false;
+      var ts = parseInt(lockStoreGet(BAN_TIME_KEY) || "0", 10);
+      if (!ts) return false;
+      return (Date.now() - ts) < BAN_TTL_MS;
+    } catch (e) { return false; }
+  }
+
 
   function gmGet(url) {
     return new Promise((resolve) => {
+      let gmSettled = false;
+      const gmDone = (v) => { if (!gmSettled) { gmSettled = true; try { clearTimeout(gmTimer); } catch (e2) {} resolve(v); } };
+      const gmTimer = setTimeout(() => gmDone(null), 10000);
       const request = (typeof GM_xmlhttpRequest !== 'undefined' && GM_xmlhttpRequest) ||
         (typeof GM !== 'undefined' && GM.xmlHttpRequest) || null;
       if (!request) {
-        resolve(null);
+        gmDone(null);
         return;
       }
       try {
@@ -304,12 +456,12 @@
           method: 'GET',
           url: url,
           timeout: 8000,
-          onload: function (response) { resolve(response); },
-          onerror: function () { resolve(null); },
-          ontimeout: function () { resolve(null); }
+          onload: function (response) { gmDone(response); },
+          onerror: function () { gmDone(null); },
+          ontimeout: function () { gmDone(null); }
         });
       } catch (e) {
-        resolve(null);
+        gmDone(null);
       }
     });
   }
@@ -322,8 +474,18 @@
       const m = d.match(/\d+/);
       return { domain: d.toLowerCase(), num: m ? parseInt(m[0], 10) : 0 };
     });
-    list.sort((a, b) => b.num - a.num);
-    return list[0].num > 0 ? list[0].domain : null;
+    const saneList = list.filter((x) => x.num >= 1 && x.num <= 5000);
+    if (saneList.length === 0) return null;
+    saneList.sort((a, b) => b.num - a.num);
+    try {
+      const cm = window.location.hostname.match(/javdb(\d+)\.com/i);
+      const curNum = cm ? parseInt(cm[1], 10) : 0;
+      if (curNum > 0 && saneList[0].num > curNum + 50) {
+        const sane = saneList.find((x) => x.num <= curNum + 50);
+        return (sane || saneList[saneList.length - 1]).domain;
+      }
+    } catch (e) {}
+    return saneList[0].domain;
   }
 
   function getCachedDomain() {
@@ -379,14 +541,39 @@
     const html = response.responseText || '';
     return parseMaxJavdbDomain(html);
   }
+  function buildAppHostUrls(cachedDomain, currentHost) {
+    const out = [];
+    const seen = new Set();
+    const push = (u) => { if (!seen.has(u)) { seen.add(u); out.push(u); } };
+    const appOf = (x) => 'https://app.' + String(x).toLowerCase() + '/';
+    const numOf = (h) => { try { const m = String(h || '').toLowerCase().match(/javdb(\d+)\.com/); return m ? parseInt(m[1], 10) : 0; } catch (e) { return 0; } };
+    if (cachedDomain) { try { push(appOf(cachedDomain)); } catch (e) {} const cn = numOf(cachedDomain); for (let i = cn - 1; i >= Math.max(1, cn - 2); i--) push('https://app.javdb' + i + '.com/'); }
+    let ch = '';
+    try { ch = String(currentHost || '').toLowerCase().replace(/^www\./, ''); } catch (e) {}
+    const n = numOf(ch);
+    if (n > 0) { push(appOf(ch)); for (let i = n + 2; i >= Math.max(1, n - 3); i--) push('https://app.javdb' + i + '.com/'); }
+    STATIC_BACKUP_DOMAINS.forEach((z) => push(appOf(z)));
+    push('https://app.javdb.com/');
+    return out;
+  }
   async function fetchLatestDomainFromApp() {
-    // 官方 App 关于页常见域名：app.javdb575.com / app.javdb575.com
-    const urls = ['https://app.javdb575.com/', 'https://app.javdb575.com/', 'https://app.javdb.com/'];
-    for (const u of urls) {
-      const r = await gmGet(u);
-      if (r && r.status === 200 && r.responseText) {
-        const d = parseMaxJavdbDomain(r.responseText);
-        if (d) return d;
+    // 官方 App 关于页常见域名：app.<mirror>.com / app.javdb.com
+    let cachedDomain = null;
+    try { const c0 = getCachedDomain(); if (c0 && c0.domain) cachedDomain = c0.domain; } catch (e) {}
+    let curHost = '';
+    try { curHost = window.location.hostname || ''; } catch (e) {}
+    const urls = buildAppHostUrls(cachedDomain, curHost);
+    const BATCH = 4;
+    let idxA = 0;
+    while (idxA < urls.length) {
+      const batch = urls.slice(idxA, idxA + BATCH);
+      idxA += BATCH;
+      const rs = await Promise.all(batch.map((u) => gmGet(u)));
+      for (const r of rs) {
+        if (r && r.status === 200 && r.responseText) {
+          const d = parseMaxJavdbDomain(r.responseText);
+          if (d) return d;
+        }
       }
     }
     return null;
@@ -407,16 +594,23 @@
     return null;
   }
 
+  let lastDomainUI = "";
   function updateDomainStatusUI() {
-    const el = document.getElementById('scraper-domain-status');
+    const el = document.getElementById("scraper-domain-status");
     if (!el) return;
     const cached = getCachedDomain();
+    var nextHTML = "";
     if (cached) {
       const ageH = ((Date.now() - cached.time) / 3600000).toFixed(1);
-      el.innerHTML = `最新域名: <b style="color:#00d26a;">${escapeHtml(cached.domain)}</b> <span style="color:#888;">(${escapeHtml(cached.source||'缓存')} · ${ageH}h前)</span>`;
+      nextHTML = `最新域名: <b style="color:#00d26a;">${escapeHtml(cached.domain)}</b> <span style="color:#888;">(${escapeHtml(cached.source||"缓存")} · ${ageH}h前)</span>`;
     } else {
-      el.innerHTML = `最新域名: <span style="color:#888;">未缓存（将按 574→569 兜底）</span>`;
+      nextHTML = `最新域名: <span style="color:#888;">未缓存（将按 备用列表兜底）</span>`;
     }
+    if (nextHTML === lastDomainUI) {
+      return;
+    }
+    lastDomainUI = nextHTML;
+    el.innerHTML = nextHTML;
   }
 
   async function refreshLatestDomain(manual = false) {
@@ -440,6 +634,8 @@
   }
 
   function scheduleDomainAutoUpdate() {
+    if (window.__javdbDomainSchedDone) { return; }
+    window.__javdbDomainSchedDone = true;
     if (domainAutoTimer) clearInterval(domainAutoTimer);
     // 启动时：若超过 6h 或无缓存则立即同步，否则仅更新 UI
     const cached = getCachedDomain();
@@ -448,13 +644,20 @@
     } else {
       updateDomainStatusUI();
     }
-    domainAutoTimer = setInterval(() => {
+    domainAutoTimer = window.__javdbScraperTimer = setInterval(() => {
       // 页面可见时才请求，避免后台空转
       if (document.visibilityState === 'visible') refreshLatestDomain(false);
       else updateDomainStatusUI();
     }, DOMAIN_AUTO_UPDATE_INTERVAL_MS);
+    var lastVisSync = 0;
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
+        var nowV = Date.now();
+        if (nowV - lastVisSync < 60000) {
+          updateDomainStatusUI();
+          return;
+        }
+        lastVisSync = nowV;
         const c = getCachedDomain();
         if (!c || (Date.now() - c.time) > DOMAIN_AUTO_UPDATE_INTERVAL_MS) refreshLatestDomain(false);
         else updateDomainStatusUI();
@@ -474,6 +677,7 @@
     removeFromQueue();
     document.title = origTitle;
     const currentHost = window.location.hostname.toLowerCase();
+    try { broadcastBanForCurrentHost(); } catch (e) {}
     const statusEl = document.getElementById('scraper-status');
     const logEl = document.getElementById('scraper-log');
 
@@ -513,6 +717,26 @@
       source = source || '递减兜底';
     }
 
+    if (!targetDomain || targetDomain === currentHost) {
+      if (logEl) {
+        logEl.innerHTML += '<br><span style="color:#ff5555; font-weight:bold;">已在最小可用域名上且无备用域名可跳，已停止自动跳转。请稍后手动重试。</span><br>';
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+      if (statusEl) {
+        statusEl.innerText = '状态: 暂无可用备用域名，已停止';
+        statusEl.style.color = '';
+      }
+      try { banStopped = true; shouldStop = true; } catch (e) {}
+      isJumping = false;
+      try {
+        var bS0 = document.getElementById('btn-start');
+        var bT0 = document.getElementById('btn-stop');
+        if (bS0) bS0.disabled = false;
+        if (bT0) bT0.disabled = true;
+      } catch (e) {}
+      return;
+    }
+
     if (logEl) {
       logEl.innerHTML += `✅ 锁定新域名: <b>${escapeHtml(targetDomain)}</b> <span style="color:#888;">(${escapeHtml(source)})</span>，3秒后自动跳转复活...<br>`;
       logEl.scrollTop = logEl.scrollHeight;
@@ -521,6 +745,8 @@
       statusEl.innerText = `🔄 3秒后跳转至: ${targetDomain}`;
     }
 
+    isJumping = true;
+    try { shouldStop = true; } catch (e) {}
     setTimeout(() => {
       try {
         const url = new URL(window.location.href);
@@ -530,6 +756,19 @@
         window.location.href = `${window.location.protocol}//${targetDomain}${window.location.pathname}${window.location.search}${window.location.hash}`;
       }
     }, 2500);
+    setTimeout(() => {
+      try {
+        if (window.location.hostname === currentHost && isJumping) {
+          isJumping = false;
+          var sEl = document.getElementById("scraper-status");
+          var bS = document.getElementById("btn-start");
+          var bT = document.getElementById("btn-stop");
+          if (sEl) { sEl.style.color = ""; sEl.innerText = "状态: 跳转未完成，可重试"; }
+          if (bS) bS.disabled = false;
+          if (bT) bT.disabled = true;
+        }
+      } catch (e) {}
+    }, 8000);
   }
 
   // 页面入口即检查：若打开网页本身就是封禁页，立即触发切域名
@@ -548,7 +787,7 @@
   panel.id = 'javdb-scraper-panel';
   panel.innerHTML = `
     <div id="scraper-header" style="font-weight: bold; margin-bottom: 8px; font-size: 14px; border-bottom: 1px solid #444; padding-bottom: 4px; cursor: move; user-select: none; display: flex; justify-content: space-between; align-items: center;">
-      <span>🐢 JavDB 磁链提取器 v5.12.5 (自动更新域名版)</span>
+      <span>🐢 JavDB 磁链提取器 v5.13.65 (自动更新域名版)</span>
       <span style="font-size: 10px; color: #888;">(按住拖动)</span>
     </div>
 
@@ -644,6 +883,7 @@
     boxShadow: '0 4px 15px rgba(0,0,0,0.5)', fontFamily: 'sans-serif'
   });
 
+  if (!document.body) return;
   document.body.appendChild(panel);
   // 定时同步最新域名（每6h + 可见性触发 + 菜单手动）
   try { scheduleDomainAutoUpdate(); } catch(e){}
@@ -678,7 +918,7 @@
   const logEl = document.getElementById('scraper-log');
   const btnStart = document.getElementById('btn-start');
   const btnStop = document.getElementById('btn-stop');
-const btnGotoCode = document.getElementById('btn-goto-code');
+  const btnGotoCode = document.getElementById('btn-goto-code');
 btnGotoCode.addEventListener('click', () => {
   const prefix = (document.getElementById('scraper-prefix').value || '').trim().toUpperCase();
   if (!prefix) { alert('请先填写番号前缀'); return; }
@@ -686,14 +926,23 @@ btnGotoCode.addEventListener('click', () => {
 });
 
 
+  let logCount = 0;
   function log(msg) {
     const time = new Date().toLocaleTimeString();
     logEl.innerHTML += `[${escapeHtml(time)}] ${escapeHtml(msg)}<br>`;
+    logCount++;
+    if (logCount % 20 !== 0) {
+      logEl.scrollTop = logEl.scrollHeight;
+      return;
+    }
+    var parts = logEl.innerHTML.split("<br>");
+    if (parts.length > 401) {
+      logEl.innerHTML = parts.slice(parts.length - 401).join("<br>");
+    }
     logEl.scrollTop = logEl.scrollHeight;
   }
 
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  const getRandomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+  // sleep/getRandomDelay hoisted to top (SCRIPT_VERSION block).
 
   function escapeHtml(str) {
     return String(str).replace(/[&<>"']/g, (c) => (
@@ -711,15 +960,16 @@ btnGotoCode.addEventListener('click', () => {
         const timer = setTimeout(() => controller.abort(), 15000);
         let res;
         try { res = await fetch(url, { signal: controller.signal }); } finally { clearTimeout(timer); }
-        if (res.status !== 429) return res;
-        lastStatus = 429;
+        if (res.status === 429) { lastStatus = 429; }
+        else if (res.status >= 500 && res.status <= 599) { lastStatus = res.status; }
+        else return res;
       } catch (e) {
         lastStatus = -1;
         if (e && e.name === 'AbortError') log('timeout ' + label);
       }
       if (attempt < 3) {
         const delay = Math.min(3000 * Math.pow(2, attempt), 30000) + getRandomDelay(0, 1000);
-        log(`⚠️ ${label}${lastStatus === 429 ? '触发限流' : '网络错误'}，约 ${Math.round(delay / 1000)} 秒后重试 (${attempt + 1}/3)...`);
+        log(`⚠️ ${label}${lastStatus === 429 ? '触发限流' : (lastStatus >= 500 ? '服务器错误' : '网络错误')}，约 ${Math.round(delay / 1000)} 秒后重试 (${attempt + 1}/3)...`);
         { const __t0 = Date.now(); let __left = delay; while (__left > 0) { if (shouldStop) return null; const __step = Math.min(5000, __left); await sleep(__step); updateLockHeartbeat(); __left = delay - (Date.now() - __t0); } }
       }
     }
@@ -729,13 +979,15 @@ btnGotoCode.addEventListener('click', () => {
 
   function parseSizeToMB(sizeStr) {
     if (!sizeStr) return Infinity;
-    const match = sizeStr.toUpperCase().match(/([\d\.]+)\s*(GB|MB|KB)/);
+    const match = sizeStr.toUpperCase().match(/([\d\.]+)\s*(TB|GB|MB|KB|B)/);
     if (!match) return Infinity;
     const num = parseFloat(match[1]);
     const unit = match[2];
+    if (unit === 'TB') return num * 1024 * 1024;
     if (unit === 'GB') return num * 1024;
     if (unit === 'MB') return num;
     if (unit === 'KB') return num / 1024;
+    if (unit === 'B') return num / 1024 / 1024;
     return Infinity;
   }
 
@@ -743,14 +995,12 @@ btnGotoCode.addEventListener('click', () => {
     const panel = doc.querySelector('.movie-panel-info') || doc.body;
     const text = (panel.textContent || '').replace(/\u00A0/g, ' ');
     const labels = '(?:時長|时长|長度|长度|片長|片长|時間|时间|Length|Duration|Time)';
-    const hm = text.match(new RegExp(labels + '[\\s\\S]{0,40}?(\\d+)\\s*(?:小時|小时|時|时)\\s*(?:(\\d+)\\s*(?:分鍾|分鐘|分钟|分))?', 'i'));
+    const hm = text.match(new RegExp(labels + '[\\s\\S]{0,40}?(\\d+)\\s*(?:小時|小时|時|时|h(?:ours?|r)?)\\s*(?:(\\d+)\\s*(?:分鍾|分鐘|分钟|分|min(?:ute)?s?))?', 'i'));
     if (hm) return parseInt(hm[1], 10) * 60 + (hm[2] ? parseInt(hm[2], 10) : 0);
-    const m = text.match(new RegExp(labels + '[\\s\\S]{0,40}?(\\d+)\\s*(?:分鍾|分鐘|分钟|分)', 'i'));
+    const m = text.match(new RegExp(labels + '[\\s\\S]{0,40}?(\\d+)\\s*(?:分鍾|分鐘|分钟|分|min(?:ute)?s?)', 'i'));
     if (m) return parseInt(m[1], 10);
-    const bareHm = text.match(/(\d+)\s*(?:小時|小时|時|时)\s*(?:(\d+)\s*(?:分鍾|分鐘|分钟|分))?/);
-    if (bareHm) return parseInt(bareHm[1], 10) * 60 + (bareHm[2] ? parseInt(bareHm[2], 10) : 0);
-    const bareM = text.match(/(\d+)\s*(?:分鍾|分鐘|分钟|分)/);
-    if (bareM) return parseInt(bareM[1], 10);
+    // bare-number fallback removed: it matched counts/dates without a duration label
+    // and wrongly skipped videos. Only label-anchored durations above are trusted.
     return null;
   }
 
@@ -774,7 +1024,7 @@ btnGotoCode.addEventListener('click', () => {
   // resolve relative hrefs to absolute
   function toAbsoluteUrl(href) {
     try {
-      return new URL(href, window.location.origin).toString();
+      return new URL(href, window.location.href).toString();
     } catch (e) {
       return href;
     }
@@ -791,6 +1041,12 @@ btnGotoCode.addEventListener('click', () => {
 
       if (isBannedPage(detailRes.status, detailHtml)) {
         return 'IP_BANNED';
+      }
+
+      if (isLoginPage(detailRes.url, detailHtml)) {
+        log(`[!] ${movieCode} 即将跳转登录页，请先登录 JavDB 后再执行`);
+        try { shouldStop = true; loginStopped = true; statusEl.innerText = '状态: 请先登录 JavDB 后再抓取'; } catch (e) {}
+        return null;
       }
 
       const parser = new DOMParser();
@@ -830,14 +1086,20 @@ btnGotoCode.addEventListener('click', () => {
       const magnetsData = [];
 
       magnetItems.forEach((mItem) => {
-        const linkTag = mItem.querySelector('a[href^="magnet:?"]');
+        let linkTag = mItem.querySelector('a[href^="magnet:?"]');
+        if (!linkTag) {
+          const anchors = mItem.querySelectorAll('a[href]');
+          for (const anchorEl of anchors) {
+            if ((anchorEl.getAttribute('href') || '').toLowerCase().startsWith('magnet:?')) { linkTag = anchorEl; break; }
+          }
+        }
         if (!linkTag) return;
 
-        const sizeTag = mItem.querySelector('.meta, .size') || mItem;
-        const sizeText = sizeTag.textContent.trim();
+        const sizeEl = mItem.querySelector('.meta, .size, [class*=size i]');
+        const sizeText = ((sizeEl ? sizeEl.textContent : mItem.textContent) || "").trim();
         const fullText = (mItem.textContent || '').toUpperCase();
 
-        const isSubbed = fullText.includes('字幕') || fullText.includes('-C.') || fullText.includes('-C-') || fullText.includes('中文');
+        const isSubbed = fullText.includes('字幕') || fullText.includes('中文') || /-C(?![A-Z0-9])/.test(fullText);
 
         magnetsData.push({
           magnet: linkTag.getAttribute('href'),
@@ -870,7 +1132,7 @@ btnGotoCode.addEventListener('click', () => {
         return chosen.magnet;
       }
     } catch (err) {
-      log(`[!] ${movieCode} 详情页读取失败`);
+      log(`[!] ${movieCode} 详情页读取失败` + (err && err.message ? ": " + String(err.message).slice(0, 120) : ""));
       return null;
     }
   }
@@ -892,7 +1154,7 @@ btnGotoCode.addEventListener('click', () => {
   }
 
   async function runScraper() {
-    isRunning = true; shouldStop = false;
+    isRunning = true; shouldStop = false; isJumping = false; loginStopped = false; tagFailed = false; banStopped = false;
     btnStart.disabled = true; btnStop.disabled = false;
 
     const lockAcquired = await acquireLock();
@@ -912,6 +1174,11 @@ btnGotoCode.addEventListener('click', () => {
 
     async function waitForNextItemSlot() {
       if (shouldStop) return false;
+      if (isFreshBanForCurrentHost()) {
+        try { log("[ban] 同域已有新鲜封禁广播，本标签停止排队"); } catch (e) {}
+        try { banStopped = true; shouldStop = true; } catch (e2) {}
+        return false;
+      }
       if (lastItemStartedAt) {
         try {
           if (lockStoreGet(LOCK_KEY) !== TAB_ID) {
@@ -929,10 +1196,19 @@ btnGotoCode.addEventListener('click', () => {
       }
 
       const elapsed = Date.now() - lastItemStartedAt;
-      const waitMs = ITEM_INTERVAL_MS - elapsed;
+      const waitMs = ITEM_INTERVAL_MS + getRandomDelay(0, 1200) - elapsed; // +0~1.2s jitter against synchronized bursts
       if (waitMs > 0) {
         log(`⏳ 等待 ${(waitMs / 1000).toFixed(1)} 秒后处理下一个...`);
-        await sleep(waitMs);
+        var __t1 = Date.now();
+        var __left1 = waitMs;
+        while (__left1 > 0) {
+          if (shouldStop) return false;
+          var __step1 = Math.min(500, __left1);
+          await sleep(__step1);
+          try { updateLockHeartbeat(); } catch (e3) {}
+          __left1 = waitMs - (Date.now() - __t1);
+        }
+        if (shouldStop) return false;
       }
       lastItemStartedAt = Date.now();
       return true;
@@ -946,14 +1222,15 @@ btnGotoCode.addEventListener('click', () => {
         const rangeStart = Number.isInteger(rawStart) && rawStart >= 0 ? rawStart : -1;
         const rangeEnd = Number.isInteger(rawEnd) && rawEnd >= 0 ? rawEnd : -1;
 
-        if (rangeStart < 0 || rangeEnd < 0 || rangeStart >= rangeEnd) {
-          alert('请输入有效的作品范围（起始小于结束，且不小于0）！');
+        if (rangeStart < 0 || rangeEnd < 0 || rangeStart > rangeEnd) {
+          alert('请输入有效的作品范围（起始不大于结束，且不小于0）！');
           btnStart.disabled = false; btnStop.disabled = true; isRunning = false;
           removeFromQueue(); document.title = origTitle; return;
         }
 
         const rawCurrPage = parseInt(document.getElementById('scraper-curr-page-start')?.value, 10);
-        const currPageStart = Number.isInteger(rawCurrPage) && rawCurrPage >= 1 ? rawCurrPage : 1;
+        if (!Number.isInteger(rawCurrPage) || rawCurrPage < 1 || rawCurrPage > 500) { alert('请检查正确的起始页码！'); btnStart.disabled = false; btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
+        const currPageStart = rawCurrPage;
 
         log('当前页面模式: 起始页码 ' + currPageStart + '，请求抓取范围 ' + rangeStart + '-' + rangeEnd);
 
@@ -974,7 +1251,7 @@ btnGotoCode.addEventListener('click', () => {
             const searchHtml = await searchRes.text();
             if (isBannedPage(searchRes.status, searchHtml)) {
               await triggerDomainJump('当前域名已遭封禁');
-            } else {
+            } else if (!handleLoginRedirect(searchRes.url, searchHtml, '当前页面列表')) {
               const searchDoc = parser.parseFromString(searchHtml, 'text/html');
               const movieNodeList = searchDoc.querySelectorAll('.movie-list .item');
               const allItems = movieNodeList ? Array.from(movieNodeList) : [];
@@ -982,8 +1259,8 @@ btnGotoCode.addEventListener('click', () => {
               if (allItems.length === 0) {
                 log('[-] 当前页面没有可抓取的作品');
               } else {
-                const items = allItems.slice(rangeStart, rangeEnd);
-                log('第 ' + currPageStart + ' 页共 ' + allItems.length + ' 个作品，本次抓取范围 ' + rangeStart + '-' + (rangeStart + items.length) + '，共 ' + items.length + ' 个');
+                const items = allItems.slice(rangeStart, Math.min(rangeEnd + 1, allItems.length));
+                log('第 ' + currPageStart + ' 页共 ' + allItems.length + ' 个作品，本次抓取范围 ' + rangeStart + '-' + (rangeStart + items.length - 1) + '，共 ' + items.length + ' 个');
 
                 for (let idx = 0; idx < items.length; idx++) {
                   if (shouldStop) break;
@@ -993,6 +1270,7 @@ btnGotoCode.addEventListener('click', () => {
                   if (!aTag) continue;
 
                   const movieHref = aTag.getAttribute('href');
+                  if (!movieHref || movieHref.indexOf('/v/') < 0) continue;
                   const codeEl = item.querySelector('.uid') || item.querySelector('strong');
                   const movieCode = codeEl ? codeEl.textContent.trim() : ('作品' + (idx + 1));
 
@@ -1008,7 +1286,6 @@ btnGotoCode.addEventListener('click', () => {
                   }
 
                   if (magnet) results.push(magnet);
-                  fetchedCount++;
                 }
               }
             }
@@ -1017,8 +1294,8 @@ btnGotoCode.addEventListener('click', () => {
           log('[!] 当前页面提取失败');
         }
 
-        const pageTitle = sanitizeFileName(origTitle || 'JavDB_列表');
-        if (results.length > 0) downloadTXT(results, sanitizeFileName(pageTitle + '_当前页面_第' + currPageStart + '页_' + rangeStart + '-' + rangeEnd));
+        const pageTitle = origTitle || 'JavDB_列表';
+        if (!isJumping && results.length > 0) downloadTXT(results, sanitizeFileName(pageTitle + '_当前页面_第' + currPageStart + '页_' + rangeStart + '-' + rangeEnd));
 
       } else if (currentMode === 'code') {
         const rawPrefix = document.getElementById('scraper-prefix').value.trim().toUpperCase();
@@ -1026,10 +1303,11 @@ btnGotoCode.addEventListener('click', () => {
         const endNum = parseInt(document.getElementById('scraper-end').value, 10);
 
         if (!rawPrefix) { alert('请输入番号前缀！'); btnStart.disabled = false; btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
-        if (isNaN(startNum) || isNaN(endNum) || startNum > endNum) { alert('请检查正确的数字范围！'); btnStart.disabled = false; btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
+        if (!Number.isInteger(startNum) || !Number.isInteger(endNum) || startNum < 1 || endNum < 1 || startNum > endNum || (endNum - startNum) > 500) { alert('请检查正确的数字范围！'); btnStart.disabled = false; btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
 
         const totalCount = endNum - startNum + 1;
-        const purePrefix = rawPrefix.replace(/^\d+/, '');
+        const purePrefix = rawPrefix.replace(/[-_\s]*\d+$/, '');
+        const basePrefix = (purePrefix && purePrefix !== rawPrefix) ? purePrefix : rawPrefix;
 
         let domainJumped = false;
         for (let i = startNum; i <= endNum; i++) {
@@ -1039,20 +1317,16 @@ btnGotoCode.addEventListener('click', () => {
           const rawNumStr = String(i);
           const pad3Str = rawNumStr.padStart(3, '0');
 
-          const searchTerms = [
-            `${rawPrefix}-${pad3Str}`,
-            `${rawPrefix}-${rawNumStr}`,
-            `${rawPrefix}${pad3Str}`
-          ];
-          if (purePrefix && purePrefix !== rawPrefix) {
-            searchTerms.push(`${purePrefix}-${pad3Str}`);
-            searchTerms.push(`${purePrefix}-${rawNumStr}`);
-          }
+          const searchTerms = [...new Set([
+            `${basePrefix}-${pad3Str}`,
+            `${basePrefix}-${rawNumStr}`,
+            `${basePrefix}${pad3Str}`
+          ])];
 
           const currentIdx = i - startNum + 1;
-          progressEl.innerText = `进度: ${currentIdx} / ${totalCount} (${rawPrefix}-${pad3Str})`;
+          progressEl.innerText = `进度: ${currentIdx} / ${totalCount} (${basePrefix}-${pad3Str})`;
           document.title = `⚡[抓取 ${currentIdx}/${totalCount}] ${origTitle}`;
-          log(`检索中: ${rawPrefix}-${pad3Str}...`);
+          log(`检索中: ${basePrefix}-${pad3Str}...`);
 
           let targetMovieLink = null;
 
@@ -1074,20 +1348,22 @@ btnGotoCode.addEventListener('click', () => {
                 break;
               }
 
+              if (handleLoginRedirect(searchRes.url, searchHtml, '番号检索')) break;
+
               const searchDoc = parser.parseFromString(searchHtml, 'text/html');
               const movieItems = searchDoc.querySelectorAll('.movie-list .item a');
 
               if (movieItems && movieItems.length > 0) {
                 for (const item of movieItems) {
                   const text = ((item.textContent || '') + ' ' + (item.getAttribute('title') || '')).toUpperCase();
-                  if (text.includes(term.toUpperCase()) || text.includes(`${rawPrefix}-${pad3Str}`)) {
+                  if (text.includes(term.toUpperCase())) {
                     targetMovieLink = item.getAttribute('href');
                     break;
                   }
                 }
               }
 
-              if (targetMovieLink ) break;
+              if (targetMovieLink) break;
             } catch (e) {}
           }
 
@@ -1095,10 +1371,10 @@ btnGotoCode.addEventListener('click', () => {
 
 
           if (!targetMovieLink) {
-            log(`[-] ${rawPrefix}-${pad3Str} 不存在/未录入`);
+            log(`[-] ${basePrefix}-${pad3Str} 不存在/未录入`);
           } else {
             const absLink = toAbsoluteUrl(targetMovieLink);
-            const magnet = await processDetailPage(absLink, `${rawPrefix}-${pad3Str}`);
+            const magnet = await processDetailPage(absLink, `${basePrefix}-${pad3Str}`);
 
             if (magnet === 'IP_BANNED') {
               await triggerDomainJump('抓取详情遭遇域名拦截');
@@ -1107,10 +1383,9 @@ btnGotoCode.addEventListener('click', () => {
             }
 
             if (magnet) results.push(magnet);
-            fetchedCount++;
           }
         }
-        if (results.length > 0) downloadTXT(results, sanitizeFileName(`${rawPrefix}_${startNum}-${endNum}`));
+        if (!isJumping && results.length > 0) downloadTXT(results, sanitizeFileName(`${basePrefix}_${startNum}-${endNum}`));
 
       } else {
         const actorName = document.getElementById('scraper-actor').value.trim();
@@ -1118,6 +1393,7 @@ btnGotoCode.addEventListener('click', () => {
         let inputStartPage = parseInt(document.getElementById('scraper-start-page').value, 10);
         let inputEndPage = parseInt(document.getElementById('scraper-end-page').value, 10);
         const orderMode = document.getElementById('scraper-order').value;
+        if (!Number.isInteger(inputStartPage) || !Number.isInteger(inputEndPage) || inputStartPage < 1 || inputEndPage < 1 || inputStartPage > 500 || inputEndPage > 500) { alert("请检查正确的页码范围！"); btnStart.disabled = false; btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
 
         const useCurrentList = !actorName;
         let baseCategoryUrl = null;
@@ -1130,7 +1406,7 @@ btnGotoCode.addEventListener('click', () => {
             const inheritCParams = (u, ...srcUrls) => {
               for (const src of srcUrls) {
                 try {
-                  new URL(src, window.location.origin).searchParams.forEach((v, k) => {
+                  new URL(src, window.location.href).searchParams.forEach((v, k) => {
                     if (/^c\d+$/.test(k) && !u.searchParams.has(k)) u.searchParams.set(k, v);
                   });
                 } catch (e) {}
@@ -1149,7 +1425,7 @@ btnGotoCode.addEventListener('click', () => {
               const tagRes = await fetchWithRetry(idxUrl, '标签索引 ');
               if (!tagRes) { log(`[-] 标签索引 ${idxUrl} 请求失败`); continue; }
               const tagHtml = await tagRes.text();
-              if (isBannedPage(tagRes.status, tagHtml)) continue;
+              if (isBannedPage(tagRes.status, tagHtml)) { try { broadcastBanForCurrentHost(); } catch (e) {} continue; }
               const tagDoc = parser.parseFromString(tagHtml, 'text/html');
               const { hit: linkHit, count } = matchTagLinks(tagDoc);
               log(`标签索引 ${idxUrl}: 状态 ${tagRes.status}，标签链接 ${count} 个${(tagRes.url || '').includes('/login') ? '（跳转到登录页，请先登录）' : ''}`);
@@ -1163,26 +1439,35 @@ btnGotoCode.addEventListener('click', () => {
                 });
                 if (boxHit) hit = { getAttribute: () => `/tags?${boxHit.name.replace(/\[\]$/, '')}=${boxHit.value}` };
               }
-              if (hit) baseCategoryUrl = inheritCParams(new URL(hit.getAttribute('href'), window.location.origin), idxUrl, window.location.href).toString();
+              if (hit) baseCategoryUrl = inheritCParams(new URL(hit.getAttribute('href'), window.location.href), idxUrl, window.location.href).toString();
             }
             if (!baseCategoryUrl && !shouldStop) {
               log('索引页未命中，尝试通过搜索结果详情页反查标签链接...');
               const sRes = await fetchWithRetry(`/search?q=${encodeURIComponent(genreName)}&f=all`, '搜索 ');
               if (sRes) {
                 const sHtml = await sRes.text();
-                if (!isBannedPage(sRes.status, sHtml)) {
+                if (!handleLoginRedirect(sRes.url, sHtml, '标签反查') && !isBannedPage(sRes.status, sHtml)) {
                   const sDoc = parser.parseFromString(sHtml, 'text/html');
                   const candidates = Array.from(sDoc.querySelectorAll('.movie-list .item a[href^="/v/"]')).slice(0, 5);
+                  if (candidates.length === 0) {
+                    const allA = Array.from(sDoc.querySelectorAll('.movie-list .item a'));
+                    for (const a of allA) {
+                      if (candidates.length >= 5) break;
+                      const h = (a.getAttribute('href') || '').toLowerCase();
+                      if (h.indexOf('/v/') >= 0) candidates.push(a);
+                    }
+                  }
                   for (const a of candidates) {
                     if (baseCategoryUrl || shouldStop) break;
                     const dRes = await fetchWithRetry(a.getAttribute('href'), '详情反查 ');
                     if (!dRes) continue;
                     const dHtml = await dRes.text();
-                    if (isBannedPage(dRes.status, dHtml)) continue;
+                    if (handleLoginRedirect(dRes.url, dHtml, '标签反查')) break;
+                    if (isBannedPage(dRes.status, dHtml)) { try { broadcastBanForCurrentHost(); } catch (e) {} continue; }
                     const dDoc = parser.parseFromString(dHtml, 'text/html');
                     const { hit } = matchTagLinks(dDoc);
                     if (hit) {
-                      baseCategoryUrl = inheritCParams(new URL(hit.getAttribute('href'), window.location.origin), window.location.href).toString();
+                      baseCategoryUrl = inheritCParams(new URL(hit.getAttribute('href'), window.location.href), window.location.href).toString();
                       break;
                     }
                   }
@@ -1192,9 +1477,14 @@ btnGotoCode.addEventListener('click', () => {
             if (baseCategoryUrl) log(`标签「${genreName}」解析为: ${baseCategoryUrl}`);
           }
           if (!baseCategoryUrl) {
+            if (loginStopped) { btnStart.disabled = false; btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
+            if (isFreshBanForCurrentHost()) {
+              await triggerDomainJump("标签反查遭遇域名拦截");
+              return;
+            }
             if (genreName) {
               log(`❌ 未能解析标签「${genreName}」，已中止抓取（避免抓错列表）。请确认已登录，或直接打开该标签页后再点开始`);
-              statusEl.innerText = '状态: 标签解析失败';
+              tagFailed = true; statusEl.innerText = '状态: 标签解析失败';
               btnStart.disabled = false; btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle;
               return;
             }
@@ -1202,7 +1492,6 @@ btnGotoCode.addEventListener('click', () => {
           }
           log(`抓取分类列表：${baseCategoryUrl}`);
         }
-        if (isNaN(inputStartPage) || isNaN(inputEndPage)) { alert('请检查正确的页码范围！'); btnStart.disabled = false; btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
 
         const minPage = Math.min(inputStartPage, inputEndPage);
         const maxPage = Math.max(inputStartPage, inputEndPage);
@@ -1215,6 +1504,7 @@ btnGotoCode.addEventListener('click', () => {
         }
 
         let domainJumped = false;
+        let emptyStreak = 0;
         for (let pIdx = 0; pIdx < pagesToVisit.length; pIdx++) {
           if (shouldStop || domainJumped) break;
           const page = pagesToVisit[pIdx];
@@ -1244,12 +1534,15 @@ btnGotoCode.addEventListener('click', () => {
               break;
             }
 
+            if (handleLoginRedirect(searchRes.url, searchHtml, '分类/女优检索')) break;
+
             const searchDoc = parser.parseFromString(searchHtml, 'text/html');
             const movieNodeList = searchDoc.querySelectorAll('.movie-list .item');
 
-            if (!movieNodeList || movieNodeList.length === 0) { log(`[-] 第 ${page} 页无作品，跳过`); continue; }
+            if (!movieNodeList || movieNodeList.length === 0) { emptyStreak++; if (emptyStreak >= 3) { log(`连续 3 页无作品，提前结束`); break; } log(`[-] 第 ${page} 页无作品，跳过`); continue; }
 
             let movieItems = Array.from(movieNodeList);
+            emptyStreak = 0;
             if (orderMode === 'old') movieItems.reverse();
 
             for (let idx = 0; idx < movieItems.length; idx++) {
@@ -1260,6 +1553,7 @@ btnGotoCode.addEventListener('click', () => {
               if (!aTag) continue;
 
               const movieHref = aTag.getAttribute('href');
+              if (!movieHref || movieHref.indexOf('/v/') < 0) continue;
               const codeEl = item.querySelector('.uid') || item.querySelector('strong');
               const movieCode = codeEl ? codeEl.textContent.trim() : `作品${idx + 1}`;
 
@@ -1276,14 +1570,13 @@ btnGotoCode.addEventListener('click', () => {
               }
 
               if (magnet) results.push(magnet);
-              fetchedCount++;
             }
           } catch (e) { log(`[!] 第 ${page} 页抓取失败`); }
         }
 
         const orderLabel = orderMode === 'new' ? '新到旧' : '旧到新';
-        const fileLabel = useCurrentList ? (genreName || sanitizeFileName(origTitle || 'JavDB_列表')) : (genreName ? `${actorName}_${genreName}` : actorName);
-        if (results.length > 0) downloadTXT(results, sanitizeFileName(`${fileLabel}_第${minPage}-${maxPage}页_${orderLabel}`));
+        const fileLabel = useCurrentList ? (genreName || (origTitle || 'JavDB_列表')) : (genreName ? `${actorName}_${genreName}` : actorName);
+        if (!isJumping && results.length > 0) downloadTXT(results, sanitizeFileName(`${fileLabel}_第${minPage}-${maxPage}页_${orderLabel}`));
       }
     } finally {
       document.title = origTitle;
@@ -1291,16 +1584,17 @@ btnGotoCode.addEventListener('click', () => {
       removeFromQueue();
     }
 
+    if (isJumping) return; // jump pending: keep jump status, skip re-enable
     statusEl.style.color = '';
-    statusEl.innerText = shouldStop ? '状态: 已手动停止' : '状态: 完成！';
+    statusEl.innerText = banStopped ? '状态: 同域封禁广播，已停止排队' : tagFailed ? '状态: 标签解析失败' : loginStopped ? '状态: 请先登录 JavDB 后再抓取' : (shouldStop ? '状态: 已手动停止' : '状态: 完成！');
     btnStart.disabled = false; btnStop.disabled = true;
   }
 
   function downloadTXT(magnets, fileNameTag) {
-    const valid = [...new Set(magnets.filter(m => m && m.startsWith('magnet:?')))];
+    const valid = [...new Set(magnets.filter(m => m && m.toLowerCase().startsWith('magnet:?')))];
     if (valid.length === 0) { log('⚠️ 未抓取到有效磁链'); return; }
 
-    const blob = new Blob([valid.join('\n')], { type: 'text/plain;charset=utf-8;' });
+    const blob = new Blob([valid.join("\r\n")], { type: 'text/plain;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
@@ -1308,7 +1602,7 @@ btnGotoCode.addEventListener('click', () => {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setTimeout(function() { try { URL.revokeObjectURL(url); } catch(e) {} }, 60000);
     log(`📁 导出成功：${fileNameTag}_迅雷专用.txt`);
   }
 
