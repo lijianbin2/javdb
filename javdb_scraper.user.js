@@ -1,7 +1,7 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.65
+// @version      5.13.78
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -33,7 +33,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.13.65';
+  const SCRIPT_VERSION = '5.13.78';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -48,7 +48,12 @@
   let currentMode = 'current';
   const ITEM_INTERVAL_MS = 2000;
 
+  var rmbCached = null;
   function autoCheckRememberMe() {
+    try {
+      if (rmbCached && rmbCached.isConnected && rmbCached.checked) { return 1; }
+      if (rmbCached && !rmbCached.isConnected) { rmbCached = null; }
+    } catch(eC) {}
     var boxes = null;
     try { boxes = document.querySelectorAll("input[type=checkbox]"); } catch(e) { return 0; }
     if (!boxes || !boxes.length) { return 0; }
@@ -76,6 +81,7 @@
         try { cb.dispatchEvent(new Event("input", { bubbles: true })); } catch(e5) {}
         try { cb.dispatchEvent(new Event("change", { bubbles: true })); } catch(e6) {}
         n++;
+        try { rmbCached = cb; } catch(eF) {}
       } catch(e7) {}
     });
     return n;
@@ -209,8 +215,7 @@
           lockStoreDel(LOCK_KEY);
           lockStoreDel(LOCK_TIME_KEY);
           if (logEl) {
-            logEl.innerHTML += `🔧 发现过期锁（${escapeHtml(currentLock)}），已回收。<br>`;
-            logEl.scrollTop = logEl.scrollHeight;
+            log("🔧 发现过期锁（" + currentLock + ")，已回收。");
           }
         } catch (e) {}
       }
@@ -240,8 +245,7 @@
 
       if (logEl && !queueWaitLogged) {
         queueWaitLogged = true;
-        logEl.innerHTML += `⏳ 前方有 ${aheadCount} 个任务正在抓取，排队等待中...<br>`;
-        logEl.scrollTop = logEl.scrollHeight;
+        log("⏳ 前方有 " + aheadCount + " 个任务正在抓取，排队等待中...");
       }
 
       await sleep(pos > 3 ? 4000 : 1500);
@@ -617,17 +621,17 @@
     const statusEl = document.getElementById('scraper-status');
     const logEl = document.getElementById('scraper-log');
     if (manual && statusEl) { statusEl.innerText = '状态: 正在同步最新域名...'; statusEl.style.color = '#ffcc00'; }
-    if (logEl) { logEl.innerHTML += `[${escapeHtml(new Date().toLocaleTimeString())}] 🔄 同步最新备用网址中...<br>`; logEl.scrollTop = logEl.scrollHeight; }
+    if (logEl) { log("🔄 同步最新备用网址中..."); }
     const res = await fetchLatestDomainMultiSource();
     if (res && res.domain) {
       setCachedDomain(res.domain, res.source);
       updateDomainStatusUI();
-      if (logEl) { logEl.innerHTML += `[${escapeHtml(new Date().toLocaleTimeString())}] ✅ 已更新: <b>${escapeHtml(res.domain)}</b>（来源 ${escapeHtml(res.source)}）<br>`; logEl.scrollTop = logEl.scrollHeight; }
+    if (logEl) { logHtml("[" + escapeHtml(new Date().toLocaleTimeString()) + "] ✅ 已更新: <b>" + escapeHtml(res.domain) + "</b>（来源 " + escapeHtml(res.source) + ")<br>"); }
       if (statusEl && manual) { statusEl.innerText = `✅ 已同步: ${res.domain}`; statusEl.style.color = '#00d26a'; }
       return res.domain;
     } else {
       updateDomainStatusUI();
-      if (logEl) { logEl.innerHTML += `[${escapeHtml(new Date().toLocaleTimeString())}] ⚠️ 同步失败，使用本地缓存/兜底列表<br>`; logEl.scrollTop = logEl.scrollHeight; }
+    if (logEl) { log("[" + escapeHtml(new Date().toLocaleTimeString()) + "] ⚠️ 同步失败，使用本地缓存/兜底列表"); }
       if (statusEl && manual) { statusEl.innerText = '⚠️ 同步失败，已保留缓存'; statusEl.style.color = '#ff6b6b'; }
       return null;
     }
@@ -682,8 +686,7 @@
     const logEl = document.getElementById('scraper-log');
 
     if (logEl) {
-      logEl.innerHTML += `<br><span style="color:#ffcc00; font-weight:bold;">🚨 [${escapeHtml(reason)}] 触发封禁，立即自动切域名...</span><br>`;
-      logEl.scrollTop = logEl.scrollHeight;
+      logHtml("<br><span style='color:#ffcc00; font-weight:bold;'>🚨 [" + escapeHtml(reason) + "] 触发封禁，立即自动切域名...</span><br>");
     }
     if (statusEl) {
       statusEl.innerText = `🚨 正在切号复活中...`;
@@ -719,8 +722,7 @@
 
     if (!targetDomain || targetDomain === currentHost) {
       if (logEl) {
-        logEl.innerHTML += '<br><span style="color:#ff5555; font-weight:bold;">已在最小可用域名上且无备用域名可跳，已停止自动跳转。请稍后手动重试。</span><br>';
-        logEl.scrollTop = logEl.scrollHeight;
+        logHtml("<br><span style='color:#ff5555; font-weight:bold;'>已在最小可用域名上且无备用域名可跳，已停止自动跳转。请稍后手动重试。</span><br>");
       }
       if (statusEl) {
         statusEl.innerText = '状态: 暂无可用备用域名，已停止';
@@ -738,8 +740,7 @@
     }
 
     if (logEl) {
-      logEl.innerHTML += `✅ 锁定新域名: <b>${escapeHtml(targetDomain)}</b> <span style="color:#888;">(${escapeHtml(source)})</span>，3秒后自动跳转复活...<br>`;
-      logEl.scrollTop = logEl.scrollHeight;
+      logHtml("✅ 锁定新域名: <b>" + escapeHtml(targetDomain) + "</b> <span style='color:#888;'>(" + escapeHtml(source) + ")</span>，3秒后自动跳转复活...<br>");
     }
     if (statusEl) {
       statusEl.innerText = `🔄 3秒后跳转至: ${targetDomain}`;
@@ -787,7 +788,7 @@
   panel.id = 'javdb-scraper-panel';
   panel.innerHTML = `
     <div id="scraper-header" style="font-weight: bold; margin-bottom: 8px; font-size: 14px; border-bottom: 1px solid #444; padding-bottom: 4px; cursor: move; user-select: none; display: flex; justify-content: space-between; align-items: center;">
-      <span>🐢 JavDB 磁链提取器 v5.13.65 (自动更新域名版)</span>
+      <span>🐢 JavDB 磁链提取器 v5.13.78 (自动更新域名版)</span>
       <span style="font-size: 10px; color: #888;">(按住拖动)</span>
     </div>
 
@@ -926,28 +927,34 @@ btnGotoCode.addEventListener('click', () => {
 });
 
 
-  let logCount = 0;
+  function logTrim() {
+    while (logEl.childElementCount > 400) {
+      logEl.removeChild(logEl.firstChild);
+    }
+  }
+  function logHtml(html) {
+    var d = document.createElement("div");
+    d.innerHTML = html;
+    logEl.appendChild(d);
+    logTrim();
+    logEl.scrollTop = logEl.scrollHeight;
+  }
   function log(msg) {
     const time = new Date().toLocaleTimeString();
-    logEl.innerHTML += `[${escapeHtml(time)}] ${escapeHtml(msg)}<br>`;
-    logCount++;
-    if (logCount % 20 !== 0) {
-      logEl.scrollTop = logEl.scrollHeight;
-      return;
-    }
-    var parts = logEl.innerHTML.split("<br>");
-    if (parts.length > 401) {
-      logEl.innerHTML = parts.slice(parts.length - 401).join("<br>");
-    }
+    var row = document.createElement("div");
+    row.textContent = "[" + time + "] " + msg;
+    logEl.appendChild(row);
+    logTrim();
     logEl.scrollTop = logEl.scrollHeight;
   }
 
   // sleep/getRandomDelay hoisted to top (SCRIPT_VERSION block).
 
+  const ESC_MAP = {"&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"};
+
+  const ESC_RE = /[&<>"']/g;
   function escapeHtml(str) {
-    return String(str).replace(/[&<>"']/g, (c) => (
-      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
-    ));
+    return String(str).replace(ESC_RE, (c) => ESC_MAP[c]);
   }
 
   async function fetchWithRetry(url, label = '请求') {
@@ -979,7 +986,7 @@ btnGotoCode.addEventListener('click', () => {
 
   function parseSizeToMB(sizeStr) {
     if (!sizeStr) return Infinity;
-    const match = sizeStr.toUpperCase().match(/([\d\.]+)\s*(TB|GB|MB|KB|B)/);
+    const match = sizeStr.toUpperCase().match(SIZE_RE);
     if (!match) return Infinity;
     const num = parseFloat(match[1]);
     const unit = match[2];
@@ -991,13 +998,22 @@ btnGotoCode.addEventListener('click', () => {
     return Infinity;
   }
 
+  const DUR_LABELS = "(?:時長|时长|長度|长度|片長|片长|時間|时间|Length|Duration|Time)";
+  const DUR_HM_RE = new RegExp(DUR_LABELS + "[\s\S]{0,40}?(\d+)\s*(?:小時|小时|時|时|h(?:ours?|r)?)\s*(?:(\d+)\s*(?:分鍾|分鐘|分钟|分|min(?:ute)?s?))?", "i");
+  const DUR_M_RE = new RegExp(DUR_LABELS + "[\s\S]{0,40}?(\d+)\s*(?:分鍾|分鐘|分钟|分|min(?:ute)?s?)", "i");
+
+  const SUB_C_RE = /-C(?![A-Z0-9])/;
+  const SIZE_RE = /([\d\.]+)\s*(TB|GB|MB|KB|B)/;
+  const VR_LABEL_TRIM_RE = /[:：]\s*$/;
+  const VR_CAT_RE = /^(?:類別|类别|分類|分类|categories?|genres?)$/;
+  const VR_TOKEN_RE = /(?:^|[^a-z0-9])vr(?:$|[^a-z0-9])/i;
+  const NBSP_RE = /\u00A0/g;
   function parseDurationMin(doc) {
     const panel = doc.querySelector('.movie-panel-info') || doc.body;
-    const text = (panel.textContent || '').replace(/\u00A0/g, ' ');
-    const labels = '(?:時長|时长|長度|长度|片長|片长|時間|时间|Length|Duration|Time)';
-    const hm = text.match(new RegExp(labels + '[\\s\\S]{0,40}?(\\d+)\\s*(?:小時|小时|時|时|h(?:ours?|r)?)\\s*(?:(\\d+)\\s*(?:分鍾|分鐘|分钟|分|min(?:ute)?s?))?', 'i'));
+    const text = (panel.textContent || '').replace(NBSP_RE, " ");
+    const hm = text.match(DUR_HM_RE);
     if (hm) return parseInt(hm[1], 10) * 60 + (hm[2] ? parseInt(hm[2], 10) : 0);
-    const m = text.match(new RegExp(labels + '[\\s\\S]{0,40}?(\\d+)\\s*(?:分鍾|分鐘|分钟|分|min(?:ute)?s?)', 'i'));
+    const m = text.match(DUR_M_RE);
     if (m) return parseInt(m[1], 10);
     // bare-number fallback removed: it matched counts/dates without a duration label
     // and wrongly skipped videos. Only label-anchored durations above are trusted.
@@ -1010,11 +1026,11 @@ btnGotoCode.addEventListener('click', () => {
 
     for (const block of blocks) {
       const labelEl = block.querySelector('strong');
-      const label = (labelEl ? labelEl.textContent : '').replace(/[:：]\s*$/, '').trim().toLowerCase();
-      if (!/^(?:類別|类别|分類|分类|categories?|genres?)$/.test(label)) continue;
+      const label = (labelEl ? labelEl.textContent : '').replace(VR_LABEL_TRIM_RE, "").trim().toLowerCase();
+      if (!VR_CAT_RE.test(label)) continue;
 
       const categories = Array.from(block.querySelectorAll('.value a, a'));
-      const hasVr = categories.some(el => /(?:^|[^a-z0-9])vr(?:$|[^a-z0-9])/i.test((el.textContent || '').trim()));
+      const hasVr = categories.some(el => VR_TOKEN_RE.test((el.textContent || '').trim()));
       if (hasVr) return true;
     }
 
@@ -1030,6 +1046,11 @@ btnGotoCode.addEventListener('click', () => {
     }
   }
 
+  let __sharedParser = null;
+  function sharedParser() {
+    if (!__sharedParser) { try { __sharedParser = new DOMParser(); } catch(eP) {} }
+    return __sharedParser;
+  }
   async function processDetailPage(movieHref, movieCode, genreTarget = '') {
     try {
       updateLockHeartbeat();
@@ -1049,7 +1070,7 @@ btnGotoCode.addEventListener('click', () => {
         return null;
       }
 
-      const parser = new DOMParser();
+      const parser = sharedParser() || new DOMParser();
       const detailDoc = parser.parseFromString(detailHtml, 'text/html');
 
       if (hasVrCategory(detailDoc)) {
@@ -1060,10 +1081,9 @@ btnGotoCode.addEventListener('click', () => {
       if (genreTarget) {
         const genreLower = genreTarget.toLowerCase();
         const tagElements = detailDoc.querySelectorAll('a[href*="/tags/"], a[href*="/genres/"], .tags .button, .meta-value a, .panel-block a');
-        let matched = false;
-        tagElements.forEach(el => {
-          const tagText = (el.textContent || '').trim().toLowerCase();
-          if (tagText === genreLower || tagText.includes(genreLower)) matched = true;
+        const matched = Array.from(tagElements).some(el => {
+          const tagText = (el.textContent || "").trim().toLowerCase();
+          return tagText === genreLower || tagText.includes(genreLower);
         });
 
         if (!matched) {
@@ -1090,16 +1110,17 @@ btnGotoCode.addEventListener('click', () => {
         if (!linkTag) {
           const anchors = mItem.querySelectorAll('a[href]');
           for (const anchorEl of anchors) {
-            if ((anchorEl.getAttribute('href') || '').toLowerCase().startsWith('magnet:?')) { linkTag = anchorEl; break; }
+            if ((anchorEl.getAttribute("href") || "").slice(0, 8).toLowerCase() === "magnet:?") { linkTag = anchorEl; break; }
           }
         }
         if (!linkTag) return;
 
+        const rawText = mItem.textContent || "";
         const sizeEl = mItem.querySelector('.meta, .size, [class*=size i]');
-        const sizeText = ((sizeEl ? sizeEl.textContent : mItem.textContent) || "").trim();
-        const fullText = (mItem.textContent || '').toUpperCase();
+        const sizeText = ((sizeEl ? sizeEl.textContent : rawText) || "").trim();
+        const fullText = rawText.toUpperCase();
 
-        const isSubbed = fullText.includes('字幕') || fullText.includes('中文') || /-C(?![A-Z0-9])/.test(fullText);
+        const isSubbed = fullText.includes('字幕') || fullText.includes('中文') || SUB_C_RE.test(fullText);
 
         magnetsData.push({
           magnet: linkTag.getAttribute('href'),
@@ -1114,17 +1135,20 @@ btnGotoCode.addEventListener('click', () => {
         return null;
       } else {
         // 超过 10GB 的磁链直接跳过（无法识别大小的保留）
-        const withinLimit = magnetsData.filter(m => m.sizeMB === Infinity || m.sizeMB <= 10240);
-        if (withinLimit.length === 0) {
+        let bestAny = null;
+        let bestSub = null;
+        for (const m of magnetsData) {
+          if (m.sizeMB !== Infinity && m.sizeMB > 10240) { continue; }
+          if (!bestAny || m.sizeMB < bestAny.sizeMB) { bestAny = m; }
+          if (m.isSubbed && (!bestSub || m.sizeMB < bestSub.sizeMB)) { bestSub = m; }
+        }
+        if (!bestAny) {
           log(`[-] ${movieCode} 磁链全部超过 10GB，跳过`);
           return null;
         }
-        const subbedList = withinLimit.filter(m => m.isSubbed);
-        let targetList = subbedList.length > 0 ? subbedList : withinLimit;
-        targetList.sort((a, b) => a.sizeMB - b.sizeMB);
-        const chosen = targetList[0];
+        const chosen = bestSub || bestAny;
 
-        if (subbedList.length > 0) {
+        if (bestSub) {
           log(`[✓] ${movieCode} | 字幕版: ${chosen.sizeText}`);
         } else {
           log(`[✓] ${movieCode} | 无字幕: ${chosen.sizeText}`);

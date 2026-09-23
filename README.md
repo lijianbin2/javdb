@@ -1,4 +1,4 @@
-# JavDB 万能磁链提取器
+﻿# JavDB 万能磁链提取器
 
 Tampermonkey 油猴脚本，一键批量提取 JavDB 磁力链接，支持多模式、多标签排队与备用域名自动切换。
 
@@ -22,7 +22,7 @@ https://github.com/lijianbin2/javdb/raw/refs/heads/main/javdb_scraper.user.js
 
 本地安装：把 H:/Codex/javdb脚本/javdb_scraper.user.js 拖入 Tampermonkey 扩展管理页。
 
-脚本头已配置 updateURL 和 downloadURL，Tampermonkey 会自动检测更新，当前 v5.13.65。
+脚本头已配置 updateURL 和 downloadURL，Tampermonkey 会自动检测更新，当前 v5.13.78。
 
 ## 使用
 
@@ -38,6 +38,19 @@ https://github.com/lijianbin2/javdb/raw/refs/heads/main/javdb_scraper.user.js
 - v5.13.63 排队等待改 500ms 分片，可中断并带锁心跳
 - v5.13.64 锁心跳写节流 5 秒，减少本地存储写入
 - v5.13.65 日志每 20 条修剪一次，最多保留约 400 行
+- v5.13.66 高频日志 innerHTML 全量重排改为逐行 appendChild，上限 400 行逐行移除首节点
+- v5.13.67 8 处一次性 innerHTML 日志旁路收敛到 log/logHtml/logTrim 统一口
+- v5.13.68 记住我命中加 rmbCached 缓存快路径，触发器不动
+- v5.13.69 时长解析 labels 与 new RegExp 提到模块级 DUR_* 常量
+- v5.13.70 escapeHtml 映射表提到模块级 ESC_MAP
+- v5.13.71 标签匹配 forEach 扫全表改为 some 命中短路
+- v5.13.72 详情页 new DOMParser 改为 sharedParser 单例复用
+- v5.13.73 磁链字幕正则提到模块级 SUB_C_RE
+- v5.13.74 磁链优选双 filter 加全排序改为单遍取最小 bestAny/bestSub
+- v5.13.75 体积解析正则提到模块级 SIZE_RE
+- v5.13.76 VR 判断三正则提到模块级 VR_*_RE
+- v5.13.77 转义正则提到模块级 ESC_RE
+- v5.13.78 收尾批量：NBSP_RE 复用、磁链行 textContent 缓存复用、磁链前缀只比前 8 字符
 
 ## 备用域名说明
 
