@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.91
+// @version      5.13.92
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -33,7 +33,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.13.91';
+  const SCRIPT_VERSION = '5.13.92';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -41,6 +41,8 @@
 
   let isRunning = false;
   let shouldStop = false;
+  let restartRequested = false;
+  let restartTimer = null;
   let isJumping = false;
   let loginStopped = false;
   let tagFailed = false;
@@ -852,7 +854,7 @@
   panel.id = 'javdb-scraper-panel';
   panel.innerHTML = `
     <div id="scraper-header" style="font-weight: bold; margin-bottom: 8px; font-size: 14px; border-bottom: 1px solid #444; padding-bottom: 4px; cursor: move; user-select: none; display: flex; justify-content: space-between; align-items: center;">
-      <span>🐢 JavDB 磁链提取器 v5.13.91 (自动更新域名版)</span>
+      <span>🐢 JavDB 磁链提取器 v5.13.92 (自动更新域名版)</span>
       <span style="font-size: 10px; color: #888;">(按住拖动)</span>
     </div>
 
@@ -984,6 +986,34 @@
   const btnStart = document.getElementById('btn-start');
   const btnStop = document.getElementById('btn-stop');
   const btnGotoCode = document.getElementById('btn-goto-code');
+  function resetStartButton() {
+    btnStart.disabled = false;
+    btnStart.textContent = '开始抓取';
+  }
+  function scheduleRestartIfNeeded() {
+    if (!restartRequested) return;
+    restartRequested = false;
+    if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
+    const launch = () => {
+      if (isRunning) {
+        restartTimer = setTimeout(launch, 50);
+        return;
+      }
+      restartTimer = null;
+      runScraper();
+    };
+    restartTimer = setTimeout(launch, 0);
+  }
+  function requestRestart() {
+    if (!isRunning) { runScraper(); return; }
+    restartRequested = true;
+    shouldStop = true;
+    btnStart.disabled = true;
+    btnStop.disabled = false;
+    statusEl.innerText = '状态: 正在停止旧任务并按新参数重新开始...';
+    statusEl.style.color = '#ffcc00';
+    log('🔄 已请求新任务：停止旧任务后，将按当前参数重新开始。');
+  }
 btnGotoCode.addEventListener('click', () => {
   const prefix = (document.getElementById('scraper-prefix').value || '').trim().toUpperCase();
   if (!prefix) { alert('请先填写番号前缀'); return; }
@@ -1243,14 +1273,16 @@ btnGotoCode.addEventListener('click', () => {
 
   async function runScraper() {
     isRunning = true; shouldStop = false; isJumping = false; loginStopped = false; tagFailed = false; banStopped = false;
-    btnStart.disabled = true; btnStop.disabled = false;
+    restartRequested = false;
+    btnStart.disabled = false; btnStart.textContent = '重新开始'; btnStop.disabled = false;
 
     const lockAcquired = await acquireLock();
     if (!lockAcquired || shouldStop) {
       document.title = origTitle;
       statusEl.innerText = '状态: 已取消';
-      btnStart.disabled = false; btnStop.disabled = true;
       isRunning = false;
+      resetStartButton(); btnStop.disabled = true;
+      scheduleRestartIfNeeded();
       return;
     }
 
@@ -1312,12 +1344,12 @@ btnGotoCode.addEventListener('click', () => {
 
         if (rangeStart < 0 || rangeEnd < 0 || rangeStart > rangeEnd) {
           alert('请输入有效的作品范围（1～500，且起始不大于结束）！');
-          btnStart.disabled = false; btnStop.disabled = true; isRunning = false;
+          resetStartButton(); btnStop.disabled = true; isRunning = false;
           removeFromQueue(); document.title = origTitle; return;
         }
 
         const rawCurrPage = Number(document.getElementById('scraper-curr-page-start')?.value);
-        if (!Number.isInteger(rawCurrPage) || rawCurrPage < 1 || rawCurrPage > 500) { alert('请检查正确的起始页码！'); btnStart.disabled = false; btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
+        if (!Number.isInteger(rawCurrPage) || rawCurrPage < 1 || rawCurrPage > 500) { alert('请检查正确的起始页码！'); resetStartButton(); btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
         const currPageStart = rawCurrPage;
 
         const totalTargets = rangeEnd - rangeStart + 1;
@@ -1410,16 +1442,16 @@ btnGotoCode.addEventListener('click', () => {
         }
 
         const pageTitle = origTitle || 'JavDB_列表';
-        if (!isJumping && results.length > 0) downloadTXT(results, sanitizeFileName(pageTitle + '_当前列表_第' + currPageStart + '页起_' + rangeStart + '-' + rangeEnd));
+        if (!isJumping && !restartRequested && results.length > 0) downloadTXT(results, sanitizeFileName(pageTitle + '_当前列表_第' + currPageStart + '页起_' + rangeStart + '-' + rangeEnd));
 
       } else if (currentMode === 'code') {
         const rawPrefix = document.getElementById('scraper-prefix').value.trim().toUpperCase();
         const startNum = Number(document.getElementById('scraper-start').value);
         const endNum = Number(document.getElementById('scraper-end').value);
 
-        if (!rawPrefix) { alert('请输入番号前缀！'); btnStart.disabled = false; btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
+        if (!rawPrefix) { alert('请输入番号前缀！'); resetStartButton(); btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
         const totalCount = endNum - startNum + 1;
-        if (!Number.isInteger(startNum) || !Number.isInteger(endNum) || startNum < 1 || endNum < 1 || startNum > endNum || totalCount > 500) { alert('请输入有效的数字范围（单次最多 500 个番号）！'); btnStart.disabled = false; btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
+        if (!Number.isInteger(startNum) || !Number.isInteger(endNum) || startNum < 1 || endNum < 1 || startNum > endNum || totalCount > 500) { alert('请输入有效的数字范围（单次最多 500 个番号）！'); resetStartButton(); btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
 
         const purePrefix = rawPrefix.replace(/[-_\s]*\d+$/, '');
         const basePrefix = (purePrefix && purePrefix !== rawPrefix) ? purePrefix : rawPrefix;
@@ -1500,7 +1532,7 @@ btnGotoCode.addEventListener('click', () => {
             if (magnet) results.push(magnet);
           }
         }
-        if (!isJumping && results.length > 0) downloadTXT(results, sanitizeFileName(`${basePrefix}_${startNum}-${endNum}`));
+        if (!isJumping && !restartRequested && results.length > 0) downloadTXT(results, sanitizeFileName(`${basePrefix}_${startNum}-${endNum}`));
 
       } else {
         const actorName = document.getElementById('scraper-actor').value.trim();
@@ -1508,7 +1540,7 @@ btnGotoCode.addEventListener('click', () => {
         let inputStartPage = Number(document.getElementById('scraper-start-page').value);
         let inputEndPage = Number(document.getElementById('scraper-end-page').value);
         const orderMode = document.getElementById('scraper-order').value;
-        if (!Number.isInteger(inputStartPage) || !Number.isInteger(inputEndPage) || inputStartPage < 1 || inputEndPage < 1 || inputStartPage > 500 || inputEndPage > 500) { alert("请检查正确的页码范围！"); btnStart.disabled = false; btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
+        if (!Number.isInteger(inputStartPage) || !Number.isInteger(inputEndPage) || inputStartPage < 1 || inputEndPage < 1 || inputStartPage > 500 || inputEndPage > 500) { alert("请检查正确的页码范围！"); resetStartButton(); btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
 
         const useCurrentList = !actorName;
         let baseCategoryUrl = null;
@@ -1592,7 +1624,7 @@ btnGotoCode.addEventListener('click', () => {
             if (baseCategoryUrl) log(`标签「${genreName}」解析为: ${baseCategoryUrl}`);
           }
           if (!baseCategoryUrl) {
-            if (loginStopped) { btnStart.disabled = false; btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
+            if (loginStopped) { resetStartButton(); btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
             if (isFreshBanForCurrentHost()) {
               await triggerDomainJump("标签反查遭遇域名拦截");
               return;
@@ -1600,7 +1632,7 @@ btnGotoCode.addEventListener('click', () => {
             if (genreName) {
               log(`❌ 未能解析标签「${genreName}」，已中止抓取（避免抓错列表）。请确认已登录，或直接打开该标签页后再点开始`);
               tagFailed = true; statusEl.innerText = '状态: 标签解析失败';
-              btnStart.disabled = false; btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle;
+              resetStartButton(); btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle;
               return;
             }
             baseCategoryUrl = window.location.href;
@@ -1691,18 +1723,20 @@ btnGotoCode.addEventListener('click', () => {
 
         const orderLabel = orderMode === 'new' ? '新到旧' : '旧到新';
         const fileLabel = useCurrentList ? (genreName || (origTitle || 'JavDB_列表')) : (genreName ? `${actorName}_${genreName}` : actorName);
-        if (!isJumping && results.length > 0) downloadTXT(results, sanitizeFileName(`${fileLabel}_第${minPage}-${maxPage}页_${orderLabel}`));
+        if (!isJumping && !restartRequested && results.length > 0) downloadTXT(results, sanitizeFileName(`${fileLabel}_第${minPage}-${maxPage}页_${orderLabel}`));
       }
     } finally {
       document.title = origTitle;
       isRunning = false;
       removeFromQueue();
+      if (!isJumping && restartRequested) scheduleRestartIfNeeded();
     }
 
     if (isJumping) return; // jump pending: keep jump status, skip re-enable
     statusEl.style.color = '';
     statusEl.innerText = banStopped ? '状态: 同域封禁广播，已停止排队' : tagFailed ? '状态: 标签解析失败' : loginStopped ? '状态: 请先登录 JavDB 后再抓取' : (shouldStop ? '状态: 已手动停止' : '状态: 完成！');
-    btnStart.disabled = false; btnStop.disabled = true;
+    resetStartButton(); btnStop.disabled = true;
+    scheduleRestartIfNeeded();
   }
 
   function downloadTXT(magnets, fileNameTag) {
@@ -1721,10 +1755,19 @@ btnGotoCode.addEventListener('click', () => {
     log(`📁 导出成功：${fileNameTag}_迅雷专用.txt`);
   }
 
-  btnStart.onclick = () => { if (!isRunning) runScraper(); };
+  btnStart.onclick = () => {
+    if (!isRunning) runScraper();
+    else requestRestart();
+  };
   btnStop.onclick = () => { if (isRunning) { shouldStop = true; statusEl.innerText = '状态: 正在停止...'; } };
 
-  const handleEnterKey = (e) => { if (e.key === 'Enter' && !isRunning) { e.preventDefault(); runScraper(); } };
+  const handleEnterKey = (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (!isRunning) runScraper();
+      else requestRestart();
+    }
+  };
   document.querySelectorAll('#javdb-scraper-panel input').forEach(input => {
     input.addEventListener('keydown', handleEnterKey);
   });
