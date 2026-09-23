@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.80
+// @version      5.13.81
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -33,7 +33,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.13.80';
+  const SCRIPT_VERSION = '5.13.81';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -583,31 +583,33 @@
     return null;
   }
   async function fetchLatestDomainMultiSource() {
-    // 并行抢跑按优先级取首个成功，避免串行超时叠加卡住检测中
-    const sources = [
-      { name: "javdb.com", fn: fetchLatestDomainFromJavdb },
-      { name: "telegram", fn: fetchLatestDomainFromTG },
-      { name: "app", fn: fetchLatestDomainFromApp },
-    ];
+    // 真抢跑：三源同时起跑，按优先级顺序等，高优命中立即返回不等慢源
+    const cap = (p, ms) => {
+      try {
+        return Promise.race([p, new Promise((resolve) => setTimeout(() => resolve(null), ms))]);
+      } catch (e) { return Promise.resolve(null); }
+    };
+    let p1 = null;
+    let p2 = null;
+    let p3 = null;
+    try { p1 = fetchLatestDomainFromJavdb(); } catch (e) { p1 = null; }
+    try { p2 = fetchLatestDomainFromTG(); } catch (e) { p2 = null; }
+    try { p3 = fetchLatestDomainFromApp(); } catch (e) { p3 = null; }
     try {
-      const timeout = new Promise((resolve) => setTimeout(() => resolve(null), 30000));
-      const work = (async () => {
-        let res = null;
-        try { res = await Promise.allSettled(sources.map((s) => { try { return s.fn(); } catch (e) { return null; } })); } catch (e) { return null; }
-        if (!res) return null;
-        let idx = 0;
-        while (idx < res.length) {
-          try {
-            const r = res[idx];
-            if (r && r.status === "fulfilled" && r.value) return { domain: r.value, source: sources[idx].name };
-          } catch (e) {}
-          idx++;
-        }
-        return null;
-      })();
-      return await Promise.race([work, timeout]);
-    } catch (e) { return null; }
+      const d1 = p1 ? await cap(p1, 12000) : null;
+      if (d1) return { domain: d1, source: "javdb.com" };
+    } catch (e) {}
+    try {
+      const d2 = p2 ? await cap(p2, 12000) : null;
+      if (d2) return { domain: d2, source: "telegram" };
+    } catch (e) {}
+    try {
+      const d3 = p3 ? await cap(p3, 15000) : null;
+      if (d3) return { domain: d3, source: "app" };
+    } catch (e) {}
+    return null;
   }
+
 
   let lastDomainUI = "";
   function updateDomainStatusUI() {
@@ -659,6 +661,15 @@
     if (domainAutoTimer) clearInterval(domainAutoTimer);
     // 启动时：若超过 6h 或无缓存则立即同步，否则仅更新 UI
     try { updateDomainStatusUI(); } catch (e) {}
+    try {
+      setTimeout(() => { try { updateDomainStatusUI(); } catch (e) {} }, 800);
+      setTimeout(() => {
+        try {
+          const el = document.getElementById("scraper-domain-status");
+          if (el && el.innerHTML.indexOf("检测中") >= 0) updateDomainStatusUI();
+        } catch (e) {}
+      }, 3000);
+    } catch (e) {}
     const cached = getCachedDomain();
     if (!cached || (Date.now() - cached.time) > DOMAIN_AUTO_UPDATE_INTERVAL_MS) {
       refreshLatestDomain(false);
@@ -805,7 +816,7 @@
   panel.id = 'javdb-scraper-panel';
   panel.innerHTML = `
     <div id="scraper-header" style="font-weight: bold; margin-bottom: 8px; font-size: 14px; border-bottom: 1px solid #444; padding-bottom: 4px; cursor: move; user-select: none; display: flex; justify-content: space-between; align-items: center;">
-      <span>🐢 JavDB 磁链提取器 v5.13.80 (自动更新域名版)</span>
+      <span>🐢 JavDB 磁链提取器 v5.13.81 (自动更新域名版)</span>
       <span style="font-size: 10px; color: #888;">(按住拖动)</span>
     </div>
 
