@@ -22,7 +22,7 @@ https://github.com/lijianbin2/javdb/raw/refs/heads/main/javdb_scraper.user.js
 
 本地安装：把 H:/Codex/javdb脚本/javdb_scraper.user.js 拖入 Tampermonkey 扩展管理页。
 
-脚本头已配置 updateURL 和 downloadURL，Tampermonkey 会自动检测更新，当前 v5.13.81。
+脚本头已配置 updateURL 和 downloadURL，Tampermonkey 会自动检测更新，当前 v5.13.82。
 
 ## 使用
 
@@ -54,6 +54,7 @@ https://github.com/lijianbin2/javdb/raw/refs/heads/main/javdb_scraper.user.js
 - v5.13.79 作品范围 0~20 改 1~20：默认起始 1，校验不小于1，切片按1基 slice(start-1,end)
 - v5.13.80 最新域名卡检测中：三源串行改并行抢跑按优先级取首个，30s总超时，启动/同步前先刷UI加防重入
 - v5.13.81 真抢跑不等慢源：三源同时起跑按优先级顺序等、高优命中立即返回，启动0.8s/3s强制再刷UI
+- v5.13.82 抢跑残留收敛：起跑即挂静默catch防未处理拒绝，cap settle即清定时器
 
 ## 备用域名说明
 
