@@ -22,7 +22,7 @@ https://github.com/lijianbin2/javdb/raw/refs/heads/main/javdb_scraper.user.js
 
 本地安装：把 H:/Codex/javdb脚本/javdb_scraper.user.js 拖入 Tampermonkey 扩展管理页。
 
-脚本头已配置 updateURL 和 downloadURL，Tampermonkey 会自动检测更新，当前 v5.13.79。
+脚本头已配置 updateURL 和 downloadURL，Tampermonkey 会自动检测更新，当前 v5.13.80。
 
 ## 使用
 
@@ -52,6 +52,7 @@ https://github.com/lijianbin2/javdb/raw/refs/heads/main/javdb_scraper.user.js
 - v5.13.77 转义正则提到模块级 ESC_RE
 - v5.13.78 收尾批量：NBSP_RE 复用、磁链行 textContent 缓存复用、磁链前缀只比前 8 字符
 - v5.13.79 作品范围 0~20 改 1~20：默认起始 1，校验不小于1，切片按1基 slice(start-1,end)
+- v5.13.80 最新域名卡检测中：三源串行改并行抢跑按优先级取首个，30s总超时，启动/同步前先刷UI加防重入
 
 ## 备用域名说明
 
