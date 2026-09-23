@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.85
+// @version      5.13.86
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -33,7 +33,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.13.85';
+  const SCRIPT_VERSION = '5.13.86';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -583,7 +583,7 @@
     return null;
   }
   async function fetchLatestDomainMultiSource() {
-    // 真抢跑：三源同时起跑，按优先级顺序等，高优命中立即返回不等慢源
+    // 真抢跑：三源同时起跑，高优先级源短暂优先，其他源命中立即返回；整体最多等待 30 秒
     const cap = (p, ms) => {
       try {
         return new Promise((resolve) => {
@@ -604,19 +604,30 @@
     try { if (p1 && p1.catch) p1.catch(() => null); } catch (e) {}
     try { if (p2 && p2.catch) p2.catch(() => null); } catch (e) {}
     try { if (p3 && p3.catch) p3.catch(() => null); } catch (e) {}
+    const sourceEntries = [
+      { promise: p1, source: "javdb.com" },
+      { promise: p2, source: "telegram" },
+      { promise: p3, source: "app" }
+    ];
+    const settled = sourceEntries.filter(({ promise }) => promise).map(({ promise, source }) =>
+      Promise.resolve(promise).then(
+        (domain) => domain ? { domain, source } : null,
+        () => null
+      )
+    );
+
+    // 给高优先级源 1.5 秒短暂窗口，避免它只慢几百毫秒就被低优先级源抢先。
     try {
-      const d1 = p1 ? await cap(p1, 12000) : null;
-      if (d1) return { domain: d1, source: "javdb.com" };
+      const highPriority = await cap(settled[0], 1500);
+      if (highPriority) return highPriority;
     } catch (e) {}
+
+    // 其余源已经同时在跑，谁先成功就返回；总上限为 1.5 + 28.5 = 30 秒。
     try {
-      const d2 = p2 ? await cap(p2, 12000) : null;
-      if (d2) return { domain: d2, source: "telegram" };
-    } catch (e) {}
-    try {
-      const d3 = p3 ? await cap(p3, 15000) : null;
-      if (d3) return { domain: d3, source: "app" };
-    } catch (e) {}
-    return null;
+      return await cap(Promise.race(settled), 28500);
+    } catch (e) {
+      return null;
+    }
   }
 
 
@@ -840,7 +851,7 @@
   panel.id = 'javdb-scraper-panel';
   panel.innerHTML = `
     <div id="scraper-header" style="font-weight: bold; margin-bottom: 8px; font-size: 14px; border-bottom: 1px solid #444; padding-bottom: 4px; cursor: move; user-select: none; display: flex; justify-content: space-between; align-items: center;">
-      <span>🐢 JavDB 磁链提取器 v5.13.85 (自动更新域名版)</span>
+      <span>🐢 JavDB 磁链提取器 v5.13.86 (自动更新域名版)</span>
       <span style="font-size: 10px; color: #888;">(按住拖动)</span>
     </div>
 

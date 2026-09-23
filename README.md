@@ -22,7 +22,7 @@ https://github.com/lijianbin2/javdb/raw/refs/heads/main/javdb_scraper.user.js
 
 本地安装：把 H:/Codex/javdb脚本/javdb_scraper.user.js 拖入 Tampermonkey 扩展管理页。
 
-脚本头已配置 updateURL 和 downloadURL，Tampermonkey 会自动检测更新，当前 v5.13.85。
+脚本头已配置 updateURL 和 downloadURL，Tampermonkey 会自动检测更新，当前 v5.13.86。
 
 ## 使用
 
@@ -58,6 +58,7 @@ https://github.com/lijianbin2/javdb/raw/refs/heads/main/javdb_scraper.user.js
 - v5.13.83 域名状态机：首次运行直接显示当前可用域名，检查中/缓存/失败兜底状态明确区分；检查锁用 finally 释放，状态栏异常也不会永久卡住
 - v5.13.84 输入边界与范围反馈：当前列表作品范围严格限制为 1～20，拒绝小数等无效数字，越界或起始位置超出实际作品数时给出明确提示；番号段按实际任务数限制为单次最多 500 个
 - v5.13.85 域名状态强制重绘：修正 3 秒刷新误查“检测中”的旧文案，并让 0.8 秒/3 秒刷新绕过内容去重，确保“检查中/缓存/失败兜底”状态真正重新写入 DOM
+- v5.13.86 域名检查竞速修正：三源真正并发竞速，高优先级源保留 1.5 秒短暂优先窗口，其他源命中立即返回，整体等待上限严格收敛为 30 秒
 
 ## 备用域名说明
 
