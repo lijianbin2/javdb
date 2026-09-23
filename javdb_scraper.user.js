@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.90
+// @version      5.13.91
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -33,7 +33,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.13.90';
+  const SCRIPT_VERSION = '5.13.91';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -852,7 +852,7 @@
   panel.id = 'javdb-scraper-panel';
   panel.innerHTML = `
     <div id="scraper-header" style="font-weight: bold; margin-bottom: 8px; font-size: 14px; border-bottom: 1px solid #444; padding-bottom: 4px; cursor: move; user-select: none; display: flex; justify-content: space-between; align-items: center;">
-      <span>🐢 JavDB 磁链提取器 v5.13.90 (自动更新域名版)</span>
+      <span>🐢 JavDB 磁链提取器 v5.13.91 (自动更新域名版)</span>
       <span style="font-size: 10px; color: #888;">(按住拖动)</span>
     </div>
 
@@ -1320,73 +1320,97 @@ btnGotoCode.addEventListener('click', () => {
         if (!Number.isInteger(rawCurrPage) || rawCurrPage < 1 || rawCurrPage > 500) { alert('请检查正确的起始页码！'); btnStart.disabled = false; btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
         const currPageStart = rawCurrPage;
 
-        log('当前页面模式: 起始页码 ' + currPageStart + '，请求抓取范围 ' + rangeStart + '-' + rangeEnd);
+        const totalTargets = rangeEnd - rangeStart + 1;
+        let processedTargets = 0;
+        let itemsBeforePage = 0;
+        let currentPage = currPageStart;
+        log('当前列表模式: 起始页码 ' + currPageStart + '，跨页顺序抓取第 ' + rangeStart + '-' + rangeEnd + ' 个作品（共 ' + totalTargets + ' 个）');
 
-        try {
+        while (!shouldStop && !isJumping && currentPage <= 500 && processedTargets < totalTargets) {
           updateLockHeartbeat();
-          const currPageUrl = (() => {
+          const pageUrl = (() => {
             try {
               const u = new URL(window.location.href);
-              u.searchParams.set('page', String(currPageStart));
+              u.searchParams.set('page', String(currentPage));
               return u.toString();
             } catch (e) { return window.location.href; }
           })();
-          const searchRes = await fetchWithRetry(currPageUrl, '当前页面列表 第' + currPageStart + '页');
-          if (shouldStop) { /* nothing to do */ }
-          else if (!searchRes) {
-            log('[-] 获取当前页面失败');
-          } else {
-            const searchHtml = await searchRes.text();
-            if (isBannedPage(searchRes.status, searchHtml)) {
-              await triggerDomainJump('当前域名已遭封禁');
-            } else if (!handleLoginRedirect(searchRes.url, searchHtml, '当前页面列表')) {
-              const searchDoc = parser.parseFromString(searchHtml, 'text/html');
-              const movieNodeList = searchDoc.querySelectorAll('.movie-list .item');
-              const allItems = movieNodeList ? Array.from(movieNodeList) : [];
+          const searchRes = await fetchWithRetry(pageUrl, '当前列表 第' + currentPage + '页');
+          if (shouldStop) break;
+          if (!searchRes) {
+            log('[-] 获取当前列表第 ' + currentPage + ' 页失败，停止继续翻页');
+            break;
+          }
 
-              if (allItems.length === 0) {
-                log('[-] 当前页面没有可抓取的作品');
-              } else if (rangeStart > allItems.length) {
-                log('[-] 起始位置 ' + rangeStart + ' 超出第 ' + currPageStart + ' 页作品数 ' + allItems.length + '，本页无可抓取范围');
-              } else {
-                const actualEnd = Math.min(rangeEnd, allItems.length);
-                const items = allItems.slice(rangeStart - 1, actualEnd);
-                log('第 ' + currPageStart + ' 页共 ' + allItems.length + ' 个作品，请求范围 ' + rangeStart + '-' + rangeEnd + '，实际抓取 ' + rangeStart + '-' + actualEnd + '，共 ' + items.length + ' 个');
+          const searchHtml = await searchRes.text();
+          if (isBannedPage(searchRes.status, searchHtml)) {
+            await triggerDomainJump('当前域名已遭封禁');
+            break;
+          }
+          if (handleLoginRedirect(searchRes.url, searchHtml, '当前列表第' + currentPage + '页')) break;
 
-                for (let idx = 0; idx < items.length; idx++) {
-                  if (shouldStop) break;
-                  if (!(await waitForNextItemSlot())) break;
-                  const item = items[idx];
-                  const aTag = item.querySelector('a');
-                  if (!aTag) continue;
+          const searchDoc = parser.parseFromString(searchHtml, 'text/html');
+          const movieNodeList = searchDoc.querySelectorAll('.movie-list .item');
+          const allItems = movieNodeList ? Array.from(movieNodeList) : [];
+          if (allItems.length === 0) {
+            log('[-] 第 ' + currentPage + ' 页没有作品，停止继续翻页');
+            break;
+          }
 
-                  const movieHref = aTag.getAttribute('href');
-                  if (!movieHref || movieHref.indexOf('/v/') < 0) continue;
-                  const codeEl = item.querySelector('.uid') || item.querySelector('strong');
-                  const movieCode = codeEl ? codeEl.textContent.trim() : ('作品' + (idx + 1));
+          const pageFirstPosition = itemsBeforePage + 1;
+          const pageLastPosition = itemsBeforePage + allItems.length;
+          const takeStart = Math.max(rangeStart, pageFirstPosition);
+          const takeEnd = Math.min(rangeEnd, pageLastPosition);
+          log('第 ' + currentPage + ' 页共 ' + allItems.length + ' 个作品，对应全局位置 ' + pageFirstPosition + '-' + pageLastPosition);
 
-                  progressEl.innerText = '进度: (' + (idx + 1) + '/' + items.length + ')';
-                  document.title = '⚡[抓取 ' + (idx + 1) + '/' + items.length + '] ' + origTitle;
-                  log('提取中: ' + movieCode + '...');
-
-                  const magnet = await processDetailPage(movieHref, movieCode);
-
-                  if (magnet === 'IP_BANNED') {
-                    await triggerDomainJump('抓取中遭遇域名拦截');
-                    break;
-                  }
-
-                  if (magnet) results.push(magnet);
-                }
+          if (takeStart <= takeEnd) {
+            const sliceStart = takeStart - pageFirstPosition;
+            const sliceEnd = takeEnd - pageFirstPosition + 1;
+            const pageItems = allItems.slice(sliceStart, sliceEnd);
+            for (let idx = 0; idx < pageItems.length; idx++) {
+              if (shouldStop || isJumping) break;
+              const absolutePosition = takeStart + idx;
+              if (!(await waitForNextItemSlot())) break;
+              const item = pageItems[idx];
+              const aTag = item.querySelector('a');
+              if (!aTag) {
+                processedTargets++;
+                progressEl.innerText = '进度: (' + processedTargets + '/' + totalTargets + ')';
+                continue;
               }
+
+              const movieHref = aTag.getAttribute('href');
+              if (!movieHref || movieHref.indexOf('/v/') < 0) {
+                processedTargets++;
+                progressEl.innerText = '进度: (' + processedTargets + '/' + totalTargets + ')';
+                continue;
+              }
+              const codeEl = item.querySelector('.uid') || item.querySelector('strong');
+              const movieCode = codeEl ? codeEl.textContent.trim() : ('作品' + absolutePosition);
+
+              processedTargets++;
+              progressEl.innerText = '进度: (' + processedTargets + '/' + totalTargets + ')';
+              document.title = '⚡[抓取 ' + processedTargets + '/' + totalTargets + '] ' + origTitle;
+              log('提取中: 第' + absolutePosition + '个 ' + movieCode + '...');
+
+              const magnet = await processDetailPage(movieHref, movieCode);
+              if (magnet === 'IP_BANNED') {
+                await triggerDomainJump('抓取中遭遇域名拦截');
+                break;
+              }
+              if (magnet) results.push(magnet);
             }
           }
-        } catch (e) {
-          log('[!] 当前页面提取失败');
+
+          itemsBeforePage = pageLastPosition;
+          currentPage++;
+          if (processedTargets < totalTargets && !shouldStop && !isJumping) {
+            log('继续翻页抓取下一个作品位置，当前累计 ' + processedTargets + '/' + totalTargets);
+          }
         }
 
         const pageTitle = origTitle || 'JavDB_列表';
-        if (!isJumping && results.length > 0) downloadTXT(results, sanitizeFileName(pageTitle + '_当前页面_第' + currPageStart + '页_' + rangeStart + '-' + rangeEnd));
+        if (!isJumping && results.length > 0) downloadTXT(results, sanitizeFileName(pageTitle + '_当前列表_第' + currPageStart + '页起_' + rangeStart + '-' + rangeEnd));
 
       } else if (currentMode === 'code') {
         const rawPrefix = document.getElementById('scraper-prefix').value.trim().toUpperCase();
