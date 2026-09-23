@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.84
+// @version      5.13.85
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -33,7 +33,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.13.84';
+  const SCRIPT_VERSION = '5.13.85';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -629,7 +629,7 @@
     } catch (e) { return null; }
   }
 
-  function updateDomainStatusUI() {
+  function updateDomainStatusUI(force = false) {
     const el = document.getElementById("scraper-domain-status");
     if (!el) return;
     const cached = getCachedDomain();
@@ -647,7 +647,7 @@
       const checkText = isRefreshing ? '检查中' : '未缓存（将按备用列表兜底）';
       nextHTML = `最新域名: <span style="color:#888;">${checkText}</span>`;
     }
-    if (nextHTML === lastDomainUI) {
+    if (!force && nextHTML === lastDomainUI) {
       return;
     }
     lastDomainUI = nextHTML;
@@ -691,13 +691,8 @@
     // 启动时：若超过 6h 或无缓存则立即同步，否则仅更新 UI
     try { updateDomainStatusUI(); } catch (e) {}
     try {
-      setTimeout(() => { try { updateDomainStatusUI(); } catch (e) {} }, 800);
-      setTimeout(() => {
-        try {
-          const el = document.getElementById("scraper-domain-status");
-          if (el && el.innerHTML.indexOf("检测中") >= 0) updateDomainStatusUI();
-        } catch (e) {}
-      }, 3000);
+      setTimeout(() => { try { updateDomainStatusUI(true); } catch (e) {} }, 800);
+      setTimeout(() => { try { updateDomainStatusUI(true); } catch (e) {} }, 3000);
     } catch (e) {}
     const cached = getCachedDomain();
     if (!cached || (Date.now() - cached.time) > DOMAIN_AUTO_UPDATE_INTERVAL_MS) {
@@ -845,7 +840,7 @@
   panel.id = 'javdb-scraper-panel';
   panel.innerHTML = `
     <div id="scraper-header" style="font-weight: bold; margin-bottom: 8px; font-size: 14px; border-bottom: 1px solid #444; padding-bottom: 4px; cursor: move; user-select: none; display: flex; justify-content: space-between; align-items: center;">
-      <span>🐢 JavDB 磁链提取器 v5.13.84 (自动更新域名版)</span>
+      <span>🐢 JavDB 磁链提取器 v5.13.85 (自动更新域名版)</span>
       <span style="font-size: 10px; color: #888;">(按住拖动)</span>
     </div>
 
