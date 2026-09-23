@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.87
+// @version      5.13.88
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -33,7 +33,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.13.87';
+  const SCRIPT_VERSION = '5.13.88';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -852,7 +852,7 @@
   panel.id = 'javdb-scraper-panel';
   panel.innerHTML = `
     <div id="scraper-header" style="font-weight: bold; margin-bottom: 8px; font-size: 14px; border-bottom: 1px solid #444; padding-bottom: 4px; cursor: move; user-select: none; display: flex; justify-content: space-between; align-items: center;">
-      <span>🐢 JavDB 磁链提取器 v5.13.87 (自动更新域名版)</span>
+      <span>🐢 JavDB 磁链提取器 v5.13.88 (自动更新域名版)</span>
       <span style="font-size: 10px; color: #888;">(按住拖动)</span>
     </div>
 
@@ -909,9 +909,9 @@
       <div style="display: flex; align-items: center; justify-content: space-between;">
         <label>抓取页数:</label>
         <div style="display: flex; gap: 4px; align-items: center;">
-          <input id="scraper-start-page" type="number" value="1" min="1" style="width: 48px; background: #333; color: #fff; border: 1px solid #555; padding: 2px 4px; border-radius: 3px;">
+          <input id="scraper-start-page" type="number" value="1" min="1" max="500" step="1" style="width: 48px; background: #333; color: #fff; border: 1px solid #555; padding: 2px 4px; border-radius: 3px;">
           <span>~</span>
-          <input id="scraper-end-page" type="number" value="1" min="1" style="width: 48px; background: #333; color: #fff; border: 1px solid #555; padding: 2px 4px; border-radius: 3px;">
+          <input id="scraper-end-page" type="number" value="1" min="1" max="500" step="1" style="width: 48px; background: #333; color: #fff; border: 1px solid #555; padding: 2px 4px; border-radius: 3px;">
         </div>
       </div>
       <div style="display: flex; align-items: center; justify-content: space-between;">
@@ -1316,7 +1316,7 @@ btnGotoCode.addEventListener('click', () => {
           removeFromQueue(); document.title = origTitle; return;
         }
 
-        const rawCurrPage = parseInt(document.getElementById('scraper-curr-page-start')?.value, 10);
+        const rawCurrPage = Number(document.getElementById('scraper-curr-page-start')?.value);
         if (!Number.isInteger(rawCurrPage) || rawCurrPage < 1 || rawCurrPage > 500) { alert('请检查正确的起始页码！'); btnStart.disabled = false; btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
         const currPageStart = rawCurrPage;
 
@@ -1481,8 +1481,8 @@ btnGotoCode.addEventListener('click', () => {
       } else {
         const actorName = document.getElementById('scraper-actor').value.trim();
         const genreName = document.getElementById('scraper-genre').value.trim();
-        let inputStartPage = parseInt(document.getElementById('scraper-start-page').value, 10);
-        let inputEndPage = parseInt(document.getElementById('scraper-end-page').value, 10);
+        let inputStartPage = Number(document.getElementById('scraper-start-page').value);
+        let inputEndPage = Number(document.getElementById('scraper-end-page').value);
         const orderMode = document.getElementById('scraper-order').value;
         if (!Number.isInteger(inputStartPage) || !Number.isInteger(inputEndPage) || inputStartPage < 1 || inputEndPage < 1 || inputStartPage > 500 || inputEndPage > 500) { alert("请检查正确的页码范围！"); btnStart.disabled = false; btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
 

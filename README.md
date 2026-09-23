@@ -22,7 +22,7 @@ https://github.com/lijianbin2/javdb/raw/refs/heads/main/javdb_scraper.user.js
 
 本地安装：把 H:/Codex/javdb脚本/javdb_scraper.user.js 拖入 Tampermonkey 扩展管理页。
 
-脚本头已配置 updateURL 和 downloadURL，Tampermonkey 会自动检测更新，当前 v5.13.87。
+脚本头已配置 updateURL 和 downloadURL，Tampermonkey 会自动检测更新，当前 v5.13.88。
 
 ## 使用
 
@@ -60,6 +60,7 @@ https://github.com/lijianbin2/javdb/raw/refs/heads/main/javdb_scraper.user.js
 - v5.13.85 域名状态强制重绘：修正 3 秒刷新误查“检测中”的旧文案，并让 0.8 秒/3 秒刷新绕过内容去重，确保“检查中/缓存/失败兜底”状态真正重新写入 DOM
 - v5.13.86 域名检查竞速修正：三源真正并发竞速，高优先级源保留 1.5 秒短暂优先窗口，其他源命中立即返回，整体等待上限严格收敛为 30 秒
 - v5.13.87 竞速空值收敛：域名源返回空值或异常时不再让 `Promise.race` 提前结束，空源会等待其他有效源或总超时
+- v5.13.88 页码输入严格校验：当前列表与女优/组合模式不再用 `parseInt` 静默截断小数或非法后缀，统一要求 `1～500` 的整数页码
 
 ## 备用域名说明
 
