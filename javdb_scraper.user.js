@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.82
+// @version      5.13.83
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -33,7 +33,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.13.82';
+  const SCRIPT_VERSION = '5.13.83';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -621,16 +621,31 @@
 
 
   let lastDomainUI = "";
+  function getCurrentNumericDomain() {
+    try {
+      const host = String(window.location.hostname || '').toLowerCase();
+      const match = host.match(/^javdb(\d+)\.com$/);
+      return match ? host : null;
+    } catch (e) { return null; }
+  }
+
   function updateDomainStatusUI() {
     const el = document.getElementById("scraper-domain-status");
     if (!el) return;
     const cached = getCachedDomain();
+    const currentDomain = getCurrentNumericDomain();
+    const isRefreshing = !!window.__javdbDomainRefreshing;
     var nextHTML = "";
     if (cached) {
-      const ageH = ((Date.now() - cached.time) / 3600000).toFixed(1);
-      nextHTML = `最新域名: <b style="color:#00d26a;">${escapeHtml(cached.domain)}</b> <span style="color:#888;">(${escapeHtml(cached.source||"缓存")} · ${ageH}h前)</span>`;
+      const ageText = cached.time > 0 ? ` · ${((Date.now() - cached.time) / 3600000).toFixed(1)}h前` : '';
+      const checkText = isRefreshing ? ' · 检查中' : '';
+      nextHTML = `最新域名: <b style="color:#00d26a;">${escapeHtml(cached.domain)}</b> <span style="color:#888;">(${escapeHtml(cached.source||"缓存")}${ageText}${checkText})</span>`;
+    } else if (currentDomain) {
+      const checkText = isRefreshing ? '检查中' : '远端检查失败时使用备用列表';
+      nextHTML = `最新域名: <b style="color:#ffcc00;">${escapeHtml(currentDomain)}</b> <span style="color:#888;">(当前可用域名 · ${checkText})</span>`;
     } else {
-      nextHTML = `最新域名: <span style="color:#888;">未缓存（将按 备用列表兜底）</span>`;
+      const checkText = isRefreshing ? '检查中' : '未缓存（将按备用列表兜底）';
+      nextHTML = `最新域名: <span style="color:#888;">${checkText}</span>`;
     }
     if (nextHTML === lastDomainUI) {
       return;
@@ -642,14 +657,19 @@
   async function refreshLatestDomain(manual = false) {
     const statusEl = document.getElementById('scraper-status');
     const logEl = document.getElementById('scraper-log');
-    if (manual && statusEl) { statusEl.innerText = '状态: 正在同步最新域名...'; statusEl.style.color = '#ffcc00'; }
-    if (logEl) { log("🔄 同步最新备用网址中..."); }
-    try { updateDomainStatusUI(); } catch (e) {}
     if (window.__javdbDomainRefreshing) return null;
     window.__javdbDomainRefreshing = true;
     let res = null;
-    try { res = await fetchLatestDomainMultiSource(); } catch (e) { res = null; }
-    window.__javdbDomainRefreshing = false;
+    try {
+      if (manual && statusEl) { statusEl.innerText = '状态: 正在同步最新域名...'; statusEl.style.color = '#ffcc00'; }
+      if (logEl) { log("🔄 同步最新备用网址中..."); }
+      updateDomainStatusUI();
+      res = await fetchLatestDomainMultiSource();
+    } catch (e) {
+      res = null;
+    } finally {
+      window.__javdbDomainRefreshing = false;
+    }
     if (res && res.domain) {
       setCachedDomain(res.domain, res.source);
       updateDomainStatusUI();
@@ -825,7 +845,7 @@
   panel.id = 'javdb-scraper-panel';
   panel.innerHTML = `
     <div id="scraper-header" style="font-weight: bold; margin-bottom: 8px; font-size: 14px; border-bottom: 1px solid #444; padding-bottom: 4px; cursor: move; user-select: none; display: flex; justify-content: space-between; align-items: center;">
-      <span>🐢 JavDB 磁链提取器 v5.13.82 (自动更新域名版)</span>
+      <span>🐢 JavDB 磁链提取器 v5.13.83 (自动更新域名版)</span>
       <span style="font-size: 10px; color: #888;">(按住拖动)</span>
     </div>
 
@@ -899,7 +919,7 @@
     </div>
 
     <div id="scraper-domain-box" style="background:#1a1a1a; border:1px solid #333; border-radius:4px; padding:6px 8px; margin-bottom:8px; font-size:11px; line-height:1.4;">
-      <div id="scraper-domain-status" style="color:#aaa; word-break:break-all;">最新域名: 检测中...</div>
+      <div id="scraper-domain-status" style="color:#aaa; word-break:break-all;">最新域名: 读取缓存...</div>
     </div>
 
     <div id="scraper-status" style="margin-bottom: 6px; color: #aaa; font-size: 12px;">状态: 准备就绪</div>
