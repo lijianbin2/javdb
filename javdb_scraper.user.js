@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.95
+// @version      5.13.96
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -33,7 +33,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.13.95';
+  const SCRIPT_VERSION = '5.13.96';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -854,7 +854,7 @@
   panel.id = 'javdb-scraper-panel';
   panel.innerHTML = `
     <div id="scraper-header" style="font-weight: bold; margin-bottom: 8px; font-size: 14px; border-bottom: 1px solid #444; padding-bottom: 4px; cursor: move; user-select: none; display: flex; justify-content: space-between; align-items: center;">
-      <span>🐢 JavDB 磁链提取器 v5.13.95 (自动更新域名版)</span>
+      <span>🐢 JavDB 磁链提取器 v5.13.96 (自动更新域名版)</span>
       <span style="font-size: 10px; color: #888;">(按住拖动)</span>
     </div>
 
@@ -1145,7 +1145,7 @@ btnGotoCode.addEventListener('click', () => {
     if (!__sharedParser) { try { __sharedParser = new DOMParser(); } catch(eP) {} }
     return __sharedParser;
   }
-  async function processDetailPage(movieHref, movieCode, genreTarget = '') {
+  async function processDetailPage(movieHref, movieCode) {
     try {
       updateLockHeartbeat();
       const detailUrl = toAbsoluteUrl(movieHref);
@@ -1170,23 +1170,6 @@ btnGotoCode.addEventListener('click', () => {
       if (hasVrCategory(detailDoc)) {
         log(`[-] ${movieCode} 類別含 VR，跳过`);
         return null;
-      }
-
-      if (genreTarget) {
-        const genreLower = genreTarget.toLowerCase();
-        const tagElements = detailDoc.querySelectorAll('a[href*="/tags/"], a[href*="/genres/"], .tags .button, .meta-value a, .panel-block a');
-        const matched = Array.from(tagElements).some(el => {
-          const tagText = (el.textContent || "").trim().toLowerCase();
-          return tagText === genreLower || tagText.includes(genreLower);
-        });
-
-        if (!matched) {
-          const infoPanel = detailDoc.querySelector('.movie-panel-info') || detailDoc.body;
-          if (!(infoPanel.textContent || '').toLowerCase().includes(genreLower)) {
-            log(`[-] ${movieCode} 不含标签 [${genreTarget}]，跳过`);
-            return null;
-          }
-        }
       }
 
       const durationMin = parseDurationMin(detailDoc);
@@ -1551,7 +1534,12 @@ btnGotoCode.addEventListener('click', () => {
           const wantedActor = normActor(actorName);
           let actorUrl = null;
           const currentActorMatch = location.pathname.match(/^\/actors\/([^/?#]+)/);
-          if (currentActorMatch) {
+          const currentActorName = document.querySelector('.actor-section-name');
+          const currentActorNameMatches = currentActorMatch && currentActorName &&
+            (normActor(currentActorName.textContent) === wantedActor ||
+             normActor(currentActorName.textContent).includes(wantedActor) ||
+             wantedActor.includes(normActor(currentActorName.textContent)));
+          if (currentActorNameMatches) {
             const currentActorUrl = new URL(window.location.href);
             ['page', 't', 'sort_type'].forEach(k => currentActorUrl.searchParams.delete(k));
             actorUrl = currentActorUrl;
@@ -1732,16 +1720,9 @@ btnGotoCode.addEventListener('click', () => {
 
           try {
             updateLockHeartbeat();
-            let searchUrl;
-            if (useCurrentList) {
-              const listObj = new URL(baseCategoryUrl || window.location.href);
-              listObj.searchParams.set('page', page);
-              searchUrl = listObj.toString();
-            } else {
-              const listObj = new URL(baseCategoryUrl || window.location.href);
-              listObj.searchParams.set('page', page);
-              searchUrl = listObj.toString();
-            }
+            const listObj = new URL(baseCategoryUrl || window.location.href);
+            listObj.searchParams.set('page', page);
+            const searchUrl = listObj.toString();
             const searchRes = await fetchWithRetry(searchUrl, '检索 ');
             if (!searchRes) {
               if (shouldStop) break;
