@@ -22,7 +22,7 @@ https://github.com/lijianbin2/javdb/raw/refs/heads/main/javdb_scraper.user.js
 
 本地安装：把 H:/Codex/javdb脚本/javdb_scraper.user.js 拖入 Tampermonkey 扩展管理页。
 
-脚本头已配置 updateURL 和 downloadURL，Tampermonkey 会自动检测更新，当前 v5.13.92。
+脚本头已配置 updateURL 和 downloadURL，Tampermonkey 会自动检测更新，当前 v5.13.93。
 
 ## 使用
 
@@ -65,6 +65,7 @@ https://github.com/lijianbin2/javdb/raw/refs/heads/main/javdb_scraper.user.js
 - v5.13.90 默认范围回退：默认结束位置恢复为 `20`，但仍允许手动输入 `1～500`；页面实际只有 40 个作品时，进度显示 `40/40`，不会把 500 当作实际作品数
 - v5.13.91 当前列表跨页连续抓取：输入 `1～100` 时从起始页第 1 个作品开始，页不足时自动翻到下一页，直到第 100 个；进度按请求范围显示，例如 `40/100`、`80/100`、`100/100`
 - v5.13.92 运行中重新开始：抓取过程中修改参数后点击“重新开始”，先停止旧任务，再按新参数启动全新任务；旧任务不会导出部分结果
+- v5.13.93 女优/组合页数范围改为按跨页累计显示：选择 `1～2` 页时进度总目标为 `80`，第二页从 `41/80` 继续显示
 
 ## 备用域名说明
 
