@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.93
+// @version      5.13.94
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -33,7 +33,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.13.93';
+  const SCRIPT_VERSION = '5.13.94';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -854,7 +854,7 @@
   panel.id = 'javdb-scraper-panel';
   panel.innerHTML = `
     <div id="scraper-header" style="font-weight: bold; margin-bottom: 8px; font-size: 14px; border-bottom: 1px solid #444; padding-bottom: 4px; cursor: move; user-select: none; display: flex; justify-content: space-between; align-items: center;">
-      <span>🐢 JavDB 磁链提取器 v5.13.93 (自动更新域名版)</span>
+      <span>🐢 JavDB 磁链提取器 v5.13.94 (自动更新域名版)</span>
       <span style="font-size: 10px; color: #888;">(按住拖动)</span>
     </div>
 
@@ -1544,7 +1544,77 @@ btnGotoCode.addEventListener('click', () => {
 
         const useCurrentList = !actorName;
         let baseCategoryUrl = null;
-        if (useCurrentList) {
+        if (!useCurrentList) {
+          // 女优/组合模式：先进入女优主页，再进入女优页上的类型分类，最后抓取分类列表。
+          // 不再先搜索全部作品、逐个进入详情页判断类型。
+          const normActor = s => (s || '').replace(/\s+/g, '').replace(/[（(][^)）]*[)）]/g, '').replace(/顏/g, '颜').toLowerCase();
+          const wantedActor = normActor(actorName);
+          let actorUrl = null;
+          const currentActorMatch = location.pathname.match(/^\/actors\/([^/?#]+)/);
+          if (currentActorMatch) {
+            const currentActorUrl = new URL(window.location.href);
+            ['page', 't', 'sort_type'].forEach(k => currentActorUrl.searchParams.delete(k));
+            actorUrl = currentActorUrl;
+          } else {
+            const actorSearchUrl = `/search?q=${encodeURIComponent(actorName)}&f=actor`;
+            const actorSearchRes = await fetchWithRetry(actorSearchUrl, '女优搜索 ');
+            if (actorSearchRes) {
+              const actorSearchHtml = await actorSearchRes.text();
+              if (handleLoginRedirect(actorSearchRes.url, actorSearchHtml, '女优搜索')) {
+                resetStartButton(); btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return;
+              }
+              if (isBannedPage(actorSearchRes.status, actorSearchHtml)) {
+                await triggerDomainJump('女优搜索遭遇域名拦截');
+                return;
+              }
+              const actorSearchDoc = parser.parseFromString(actorSearchHtml, 'text/html');
+              const actorLinks = Array.from(actorSearchDoc.querySelectorAll('#actors a[href*="/actors/"]'));
+              let actorLink = actorLinks.find(a => normActor(a.textContent) === wantedActor);
+              if (!actorLink) actorLink = actorLinks.find(a => normActor(a.textContent).includes(wantedActor));
+              if (actorLink) actorUrl = new URL(actorLink.getAttribute('href'), window.location.href);
+            }
+          }
+
+          if (!actorUrl) {
+            log(`❌ 未能找到女优「${actorName}」页面，已中止抓取。`);
+            tagFailed = true; statusEl.innerText = '状态: 女优页面解析失败';
+            resetStartButton(); btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return;
+          }
+
+          if (genreName) {
+            const actorRes = await fetchWithRetry(actorUrl, '女优页面 ');
+            if (!actorRes) {
+              log(`[-] 女优页面 ${actorUrl} 请求失败`);
+              resetStartButton(); btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return;
+            }
+            const actorHtml = await actorRes.text();
+            if (isBannedPage(actorRes.status, actorHtml)) {
+              await triggerDomainJump('女优页面遭遇域名拦截');
+              return;
+            }
+            if (handleLoginRedirect(actorRes.url, actorHtml, '女优页面')) {
+              resetStartButton(); btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return;
+            }
+            const actorDoc = parser.parseFromString(actorHtml, 'text/html');
+            const wantedGenre = normActor(genreName);
+            const genreLinks = Array.from(actorDoc.querySelectorAll('.actor-tags a[href*="/actors/"]'));
+            let genreLink = genreLinks.find(a => normActor(a.textContent) === wantedGenre);
+            if (!genreLink) genreLink = genreLinks.find(a => {
+              const t = normActor(a.textContent);
+              return t && (t.includes(wantedGenre) || wantedGenre.includes(t));
+            });
+            if (!genreLink) {
+              log(`❌ 女优「${actorName}」页面未找到类型「${genreName}」，已中止抓取。`);
+              tagFailed = true; statusEl.innerText = '状态: 类型分类解析失败';
+              resetStartButton(); btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return;
+            }
+            baseCategoryUrl = new URL(genreLink.getAttribute('href'), actorUrl).toString();
+            log(`已进入女优「${actorName}」的类型分类：${genreName}`);
+          } else {
+            baseCategoryUrl = actorUrl.toString();
+            log(`已进入女优页面：${actorName}`);
+          }
+        } else {
           if (/\/tags(\/|$|\?)/.test(location.pathname + location.search)) {
             baseCategoryUrl = window.location.href;
           } else if (genreName) {
@@ -1658,7 +1728,7 @@ btnGotoCode.addEventListener('click', () => {
         for (let pIdx = 0; pIdx < pagesToVisit.length; pIdx++) {
           if (shouldStop || domainJumped) break;
           const page = pagesToVisit[pIdx];
-          log(useCurrentList ? `抓取当前分类 第 ${page} 页...` : `检索女优 [${actorName}] 第 ${page} 页...`);
+          log(useCurrentList ? `抓取当前分类 第 ${page} 页...` : `抓取女优 [${actorName}] 分类第 ${page} 页...`);
 
           try {
             updateLockHeartbeat();
@@ -1668,7 +1738,9 @@ btnGotoCode.addEventListener('click', () => {
               listObj.searchParams.set('page', page);
               searchUrl = listObj.toString();
             } else {
-              searchUrl = `/search?q=${encodeURIComponent(actorName)}&page=${page}&f=all`;
+              const listObj = new URL(baseCategoryUrl || window.location.href);
+              listObj.searchParams.set('page', page);
+              searchUrl = listObj.toString();
             }
             const searchRes = await fetchWithRetry(searchUrl, '检索 ');
             if (!searchRes) {
@@ -1712,7 +1784,7 @@ btnGotoCode.addEventListener('click', () => {
 
               log(`检查标签中: ${movieCode}...`);
 
-              const magnet = await processDetailPage(movieHref, movieCode, useCurrentList ? '' : genreName);
+              const magnet = await processDetailPage(movieHref, movieCode);
 
               if (magnet === 'IP_BANNED') {
                 await triggerDomainJump('抓取详情遭遇域名拦截');
