@@ -1,10 +1,10 @@
-﻿# JavDB 万能磁链提取器
+# JavDB 万能磁链提取器
 
 Tampermonkey 油猴脚本，一键批量提取 JavDB 磁力链接，支持多模式、多标签排队与备用域名自动切换。
 
 ## 功能
 
-- 三种抓取模式：当前列表按位置 0~20 加起始页码，番号段按前缀加数字范围，女优组合按名称加类型标签加页码范围
+- 三种抓取模式：当前列表按位置 1~20 加起始页码，番号段按前缀加数字范围，女优组合按名称加类型标签加页码范围
 - 磁链优选：优先字幕版，同组内体积最小，去重后导出迅雷专用 TXT
 - 过滤：自动跳过 VR 分类、时长超过 150 分钟、单磁链超过 10GB
 - 稳定：429 限流指数退避重试，页内 2 秒间隔，多标签排队锁，45 秒锁过期自动回收
@@ -22,7 +22,7 @@ https://github.com/lijianbin2/javdb/raw/refs/heads/main/javdb_scraper.user.js
 
 本地安装：把 H:/Codex/javdb脚本/javdb_scraper.user.js 拖入 Tampermonkey 扩展管理页。
 
-脚本头已配置 updateURL 和 downloadURL，Tampermonkey 会自动检测更新，当前 v5.13.78。
+脚本头已配置 updateURL 和 downloadURL，Tampermonkey 会自动检测更新，当前 v5.13.79。
 
 ## 使用
 
@@ -51,6 +51,7 @@ https://github.com/lijianbin2/javdb/raw/refs/heads/main/javdb_scraper.user.js
 - v5.13.76 VR 判断三正则提到模块级 VR_*_RE
 - v5.13.77 转义正则提到模块级 ESC_RE
 - v5.13.78 收尾批量：NBSP_RE 复用、磁链行 textContent 缓存复用、磁链前缀只比前 8 字符
+- v5.13.79 作品范围 0~20 改 1~20：默认起始 1，校验不小于1，切片按1基 slice(start-1,end)
 
 ## 备用域名说明
 

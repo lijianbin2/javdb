@@ -1,7 +1,7 @@
-﻿// ==UserScript==
+// ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.78
+// @version      5.13.79
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -33,7 +33,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.13.78';
+  const SCRIPT_VERSION = '5.13.79';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -788,7 +788,7 @@
   panel.id = 'javdb-scraper-panel';
   panel.innerHTML = `
     <div id="scraper-header" style="font-weight: bold; margin-bottom: 8px; font-size: 14px; border-bottom: 1px solid #444; padding-bottom: 4px; cursor: move; user-select: none; display: flex; justify-content: space-between; align-items: center;">
-      <span>🐢 JavDB 磁链提取器 v5.13.78 (自动更新域名版)</span>
+      <span>🐢 JavDB 磁链提取器 v5.13.79 (自动更新域名版)</span>
       <span style="font-size: 10px; color: #888;">(按住拖动)</span>
     </div>
 
@@ -802,7 +802,7 @@
       <div style="display: flex; align-items: center; justify-content: space-between;">
         <label>作品范围:</label>
         <div style="display: flex; gap: 4px; align-items: center;">
-          <input id="scraper-curr-start" type="number" value="0" min="0" step="1" placeholder="0" style="width: 48px; background: #333; color: #fff; border: 1px solid #555; padding: 2px 4px; border-radius: 3px;">
+          <input id="scraper-curr-start" type="number" value="1" min="1" step="1" placeholder="1" style="width: 48px; background: #333; color: #fff; border: 1px solid #555; padding: 2px 4px; border-radius: 3px;">
           <span>~</span>
           <input id="scraper-curr-end" type="number" value="20" min="0" step="1" placeholder="20" style="width: 48px; background: #333; color: #fff; border: 1px solid #555; padding: 2px 4px; border-radius: 3px;">
         </div>
@@ -1243,11 +1243,11 @@ btnGotoCode.addEventListener('click', () => {
       if (currentMode === 'current') {
         const rawStart = parseInt(document.getElementById('scraper-curr-start').value, 10);
         const rawEnd = parseInt(document.getElementById('scraper-curr-end').value, 10);
-        const rangeStart = Number.isInteger(rawStart) && rawStart >= 0 ? rawStart : -1;
-        const rangeEnd = Number.isInteger(rawEnd) && rawEnd >= 0 ? rawEnd : -1;
+        const rangeStart = Number.isInteger(rawStart) && rawStart >= 1 ? rawStart : -1;
+        const rangeEnd = Number.isInteger(rawEnd) && rawEnd >= 1 ? rawEnd : -1;
 
         if (rangeStart < 0 || rangeEnd < 0 || rangeStart > rangeEnd) {
-          alert('请输入有效的作品范围（起始不大于结束，且不小于0）！');
+          alert('请输入有效的作品范围（起始不大于结束，且不小于1）！');
           btnStart.disabled = false; btnStop.disabled = true; isRunning = false;
           removeFromQueue(); document.title = origTitle; return;
         }
@@ -1283,7 +1283,7 @@ btnGotoCode.addEventListener('click', () => {
               if (allItems.length === 0) {
                 log('[-] 当前页面没有可抓取的作品');
               } else {
-                const items = allItems.slice(rangeStart, Math.min(rangeEnd + 1, allItems.length));
+                const items = allItems.slice(rangeStart - 1, Math.min(rangeEnd, allItems.length));
                 log('第 ' + currPageStart + ' 页共 ' + allItems.length + ' 个作品，本次抓取范围 ' + rangeStart + '-' + (rangeStart + items.length - 1) + '，共 ' + items.length + ' 个');
 
                 for (let idx = 0; idx < items.length; idx++) {
