@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.99
-// @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；封禁跳转到新域名并重新登录后自动断点续抓（保留已抓磁链与进度）；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
+// @version      5.14.0
+// @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置激进/标准/保守三档速度与自适应请求间隔（连续成功自动提速，遇到限流自动降速）；内置 429/封禁重试、备用域名自动切换与多标签排队保护；封禁跳转到新域名并重新登录后自动断点续抓（保留已抓磁链与进度）；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
 // @match        *://javdb.com/*
@@ -33,7 +33,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.13.99';
+  const SCRIPT_VERSION = '5.14.0';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -51,7 +51,67 @@
   let activeTask = null;      // 当前运行任务（用于封禁跳域名前保存断点）
   let resumeState = null;     // 待恢复的抓取断点
   let resumeAutoTimer = null; // 恢复流程的定时器句柄
-  const ITEM_INTERVAL_MS = 2000;
+  // —— 自适应请求间隔 ——
+  // 不再是固定 2 秒 + 固定 1.2 秒抖动，而是「基准间隔 × 比例抖动 + 遇限流自动退避」。
+  // 连续成功时逐步提速，遇到 429/5xx/超时则自动降速并进入冷却。
+  const SPEED_PRESETS = {
+    fast:   { base: 650,  min: 400,  max: 6000,  jitter: 0.35, label: '激进（最快）' },
+    normal: { base: 1400, min: 800,  max: 9000,  jitter: 0.30, label: '标准' },
+    safe:   { base: 2600, min: 1600, max: 15000, jitter: 0.25, label: '保守（不易被封）' }
+  };
+  const SPEED_STORE_KEY = 'javdb_speed_mode';
+  let speedMode = 'normal';
+  const paceState = { base: 0, floor: 0, cooldownUntil: 0, strikes: 0, inited: false, waitLogged: 0 };
+
+  function paceInit() {
+    if (paceState.inited) return;
+    const p = SPEED_PRESETS[speedMode] || SPEED_PRESETS.normal;
+    paceState.base = p.base;
+    paceState.floor = p.min;
+    paceState.cooldownUntil = 0;
+    paceState.strikes = 0;
+    paceState.waitLogged = 0;
+    paceState.inited = true;
+  }
+
+  function paceReset() {
+    paceState.inited = false;
+    paceState.cooldownUntil = 0;
+    paceState.strikes = 0;
+    paceState.waitLogged = 0;
+    paceInit();
+  }
+
+  // 请求成功：逐步回落到预设基准（最快只到预设 base，不无限加速）
+  function paceOnSuccess() {
+    paceInit();
+    const p = SPEED_PRESETS[speedMode] || SPEED_PRESETS.normal;
+    paceState.strikes = 0;
+    if (paceState.base > p.base) paceState.base = Math.max(p.base, paceState.base - 150);
+    if (paceState.floor > p.min) paceState.floor = Math.max(p.min, paceState.floor - 150);
+    if (paceState.cooldownUntil && paceState.cooldownUntil < Date.now()) paceState.cooldownUntil = 0;
+  }
+
+  // 限流/错误：立刻退避并进入指数冷却
+  function paceOnThrottle(kind) {
+    paceInit();
+    const p = SPEED_PRESETS[speedMode] || SPEED_PRESETS.normal;
+    paceState.strikes++;
+    const mult = kind === 'rate' ? 2.0 : 1.5;
+    paceState.base = Math.min(p.max, Math.round(paceState.base * mult) + 400);
+    paceState.floor = Math.min(p.max, Math.round(paceState.floor * mult) + 400);
+    const cool = Math.min(45000, (kind === 'rate' ? 4000 : 1500) * Math.pow(2, Math.min(paceState.strikes, 4)));
+    paceState.cooldownUntil = Math.max(paceState.cooldownUntil, Date.now() + cool);
+  }
+
+  // 本次请求前的目标间隔：比例抖动，避免固定节奏被识别
+  function paceTargetMs() {
+    paceInit();
+    const p = SPEED_PRESETS[speedMode] || SPEED_PRESETS.normal;
+    const b = Math.max(paceState.base, paceState.floor);
+    const jitter = 1 + (Math.random() * 2 - 1) * p.jitter;
+    return Math.max(300, Math.round(b * jitter));
+  }
 
   var rmbCached = null;
   function autoCheckRememberMe() {
@@ -420,8 +480,11 @@
     genreName: 'scraper-genre',
     actorPageStart: 'scraper-start-page',
     actorPageEnd: 'scraper-end-page',
-    order: 'scraper-order'
+    order: 'scraper-order',
+    speed: 'scraper-speed'
   };
+  // 这些字段不参与「是否同一任务」的判定：改了它们仍视为继续原任务
+  const RESUME_NON_TASK_FIELDS = { speed: true };
 
   function collectPanelInputs() {
     const out = {};
@@ -437,6 +500,11 @@
     for (const key in RESUME_FIELD_MAP) {
       const el = document.getElementById(RESUME_FIELD_MAP[key]);
       if (el && inputs[key] !== undefined && inputs[key] !== null) el.value = inputs[key];
+    }
+    // 速度是运行参数，需要同步到模块状态
+    if (inputs.speed && SPEED_PRESETS[inputs.speed]) {
+      speedMode = inputs.speed;
+      paceState.inited = false;
     }
   }
 
@@ -961,6 +1029,15 @@
       <label style="cursor: pointer;"><input type="radio" name="scraper-mode" value="actor"> 女优/组合</label>
     </div>
 
+    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; font-size: 11px;">
+      <label for="scraper-speed" style="color:#aaa;">抓取速度:</label>
+      <select id="scraper-speed" style="background: #333; color: #fff; border: 1px solid #555; padding: 2px 5px; border-radius: 3px; font-size: 11px;">
+        <option value="fast">激进（最快）</option>
+        <option value="normal" selected>标准</option>
+        <option value="safe">保守（不易被封）</option>
+      </select>
+    </div>
+
     <div id="section-current" style="display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; font-size: 12px;">
       <div style="display: flex; align-items: center; justify-content: space-between;">
         <label>作品范围:</label>
@@ -1073,6 +1150,25 @@
     });
   });
 
+  // 抓取速度：恢复上次选择 + 切换时立即重算自适应间隔
+  const speedSel = document.getElementById('scraper-speed');
+  try {
+    const savedSpeed = lockStoreGet(SPEED_STORE_KEY);
+    if (savedSpeed && SPEED_PRESETS[savedSpeed]) speedMode = savedSpeed;
+  } catch (e) {}
+  if (speedSel) {
+    speedSel.value = speedMode;
+    speedSel.addEventListener('change', (e) => {
+      const v = e.target.value;
+      if (!SPEED_PRESETS[v]) return;
+      speedMode = v;
+      try { lockStoreSet(SPEED_STORE_KEY, v); } catch (err) {}
+      paceReset();
+      const p = SPEED_PRESETS[v];
+      log(`⚡ 抓取速度已切换为「${p.label}」，基准间隔约 ${Math.round(p.base / 100) / 10} 秒（连续成功会自动提速，遇到限流会自动降速）`);
+    });
+  }
+
   const statusEl = document.getElementById('scraper-status');
   const progressEl = document.getElementById('scraper-progress');
   const logEl = document.getElementById('scraper-log');
@@ -1158,11 +1254,11 @@ btnGotoCode.addEventListener('click', () => {
         const timer = setTimeout(() => controller.abort(), 15000);
         let res;
         try { res = await fetch(url, { signal: controller.signal }); } finally { clearTimeout(timer); }
-        if (res.status === 429) { lastStatus = 429; }
-        else if (res.status >= 500 && res.status <= 599) { lastStatus = res.status; }
-        else return res;
+        if (res.status === 429) { lastStatus = 429; paceOnThrottle('rate'); }
+        else if (res.status >= 500 && res.status <= 599) { lastStatus = res.status; paceOnThrottle('error'); }
+        else { paceOnSuccess(); return res; }
       } catch (e) {
-        lastStatus = -1;
+        lastStatus = -1; paceOnThrottle('error');
         if (e && e.name === 'AbortError') log('timeout ' + label);
       }
       if (attempt < 3) {
@@ -1355,6 +1451,7 @@ btnGotoCode.addEventListener('click', () => {
   async function runScraper() {
     isRunning = true; shouldStop = false; isJumping = false; loginStopped = false; tagFailed = false; banStopped = false;
     restartRequested = false;
+    paceReset(); // 每个新任务从所选预设的基准间隔重新起步
     btnStart.disabled = false; btnStart.textContent = '重新开始'; btnStop.disabled = false;
 
     const lockAcquired = await acquireLock();
@@ -1369,6 +1466,10 @@ btnGotoCode.addEventListener('click', () => {
 
     document.title = `⚡[抓取中...] ${origTitle}`;
     statusEl.innerText = '状态: 正在抓取中...';
+    {
+      const p0 = SPEED_PRESETS[speedMode] || SPEED_PRESETS.normal;
+      log(`⚡ 抓取速度：${p0.label}（起始基准间隔约 ${Math.round(p0.base / 100) / 10} 秒，连续成功自动提速，遇到 429/超时自动降速）`);
+    }
     const results = [];
     const doneCodes = new Set();
     // 恢复断点：已抓磁链 + 已处理番号，results 复用同一数组引用以便自动同步
@@ -1415,15 +1516,24 @@ btnGotoCode.addEventListener('click', () => {
         return true;
       }
 
-      const elapsed = Date.now() - lastItemStartedAt;
-      const waitMs = ITEM_INTERVAL_MS + getRandomDelay(0, 1200) - elapsed; // +0~1.2s jitter against synchronized bursts
+      paceInit();
+      const now = Date.now();
+      // 起点对齐：距上次发起请求满目标间隔即可放行
+      let dueAt = lastItemStartedAt + paceTargetMs();
+      // 限流冷却优先于常规间隔
+      if (paceState.cooldownUntil > dueAt) dueAt = paceState.cooldownUntil;
+      const waitMs = dueAt - now;
       if (waitMs > 0) {
-        log(`⏳ 等待 ${(waitMs / 1000).toFixed(1)} 秒后处理下一个...`);
+        // 降低刷屏与 DOM 开销：只在等待较久时记录
+        paceState.waitLogged++;
+        if (waitMs >= 1500 || paceState.waitLogged % 10 === 0) {
+          log(`⏳ 等待 ${(waitMs / 1000).toFixed(1)} 秒后处理下一个...（自适应间隔 ${Math.round(Math.max(paceState.base, paceState.floor))}ms）`);
+        }
         var __t1 = Date.now();
         var __left1 = waitMs;
         while (__left1 > 0) {
           if (shouldStop) return false;
-          var __step1 = Math.min(500, __left1);
+          var __step1 = Math.min(250, __left1);
           await sleep(__step1);
           try { updateLockHeartbeat(); } catch (e3) {}
           __left1 = waitMs - (Date.now() - __t1);
@@ -1964,6 +2074,7 @@ btnGotoCode.addEventListener('click', () => {
     if (resumeState.mode !== currentMode) return false;
     const now = collectPanelInputs();
     for (const key in RESUME_FIELD_MAP) {
+      if (RESUME_NON_TASK_FIELDS[key]) continue;
       const a = now[key] === undefined ? '' : String(now[key]);
       const b = resumeState.inputs[key] === undefined ? '' : String(resumeState.inputs[key]);
       if (a !== b) return false;
