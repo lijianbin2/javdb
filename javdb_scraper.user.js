@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.13.98
-// @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
+// @version      5.13.99
+// @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置 429/封禁重试、备用域名自动切换与多标签排队保护；封禁跳转到新域名并重新登录后自动断点续抓（保留已抓磁链与进度）；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
 // @match        *://javdb.com/*
@@ -33,7 +33,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.13.96';
+  const SCRIPT_VERSION = '5.13.99';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -48,6 +48,9 @@
   let tagFailed = false;
   let banStopped = false;
   let currentMode = 'current';
+  let activeTask = null;      // 当前运行任务（用于封禁跳域名前保存断点）
+  let resumeState = null;     // 待恢复的抓取断点
+  let resumeAutoTimer = null; // 恢复流程的定时器句柄
   const ITEM_INTERVAL_MS = 2000;
 
   var rmbCached = null;
@@ -280,6 +283,7 @@
 
   window.addEventListener('pagehide', () => {
     document.title = origTitle;
+    try { if (isRunning) saveResumeTask('页面关闭'); } catch (e) {}
     removeFromQueue();
   });
 
@@ -309,6 +313,8 @@
 
   function handleLoginRedirect(url, html, label) {
     if (!isLoginPage(url, html)) return false;
+    // 登录中断：保留断点，登录后可继续
+    try { if (isRunning) saveResumeTask('需要登录'); } catch (e) {}
     try { log('[!] ' + label + ' 即将跳转登录页，请先登录 JavDB 后再执行'); } catch (e) {}
     try { shouldStop = true; loginStopped = true; statusEl.innerText = '状态: 请先登录 JavDB 后再抓取'; } catch (e) {}
     return true;
@@ -398,6 +404,92 @@
     try { delete __asyncGmCache[key]; } catch (e) {}
     try { localStorage.removeItem(key); } catch (e) {}
   }
+
+  // —— 断点续抓（跨域：GM 存储在所有 JavDB 镜像域名间共享）——
+  const TASK_RESUME_KEY = 'javdb_resume_task';
+  const RESUME_TTL_MS = 45 * 60 * 1000; // 断点有效期 45 分钟
+  const AUTO_RESUME_TTL_MS = 20 * 60 * 1000; // 超过 20 分钟不再自动抢焦点，仅保留「继续抓取」按钮
+  const RESUME_FIELD_MAP = {
+    currStart: 'scraper-curr-start',
+    currEnd: 'scraper-curr-end',
+    currPageStart: 'scraper-curr-page-start',
+    prefix: 'scraper-prefix',
+    codeStart: 'scraper-start',
+    codeEnd: 'scraper-end',
+    actorName: 'scraper-actor',
+    genreName: 'scraper-genre',
+    actorPageStart: 'scraper-start-page',
+    actorPageEnd: 'scraper-end-page',
+    order: 'scraper-order'
+  };
+
+  function collectPanelInputs() {
+    const out = {};
+    for (const key in RESUME_FIELD_MAP) {
+      const el = document.getElementById(RESUME_FIELD_MAP[key]);
+      if (el) out[key] = el.value;
+    }
+    return out;
+  }
+
+  function applyPanelInputs(inputs) {
+    if (!inputs) return;
+    for (const key in RESUME_FIELD_MAP) {
+      const el = document.getElementById(RESUME_FIELD_MAP[key]);
+      if (el && inputs[key] !== undefined && inputs[key] !== null) el.value = inputs[key];
+    }
+  }
+
+  function currentBasePath() {
+    try { return location.pathname + location.search; } catch (e) { return '/'; }
+  }
+
+  function saveResumeTask(reason) {
+    if (!activeTask) return;
+    try {
+      const payload = {
+        version: 1,
+        timestamp: Date.now(),
+        reason: reason || '',
+        mode: activeTask.mode || currentMode,
+        inputs: collectPanelInputs(),
+        results: (activeTask.results || []).slice(),
+        doneCodes: Array.from(activeTask.doneCodes || []),
+        basePath: currentBasePath(),
+        needsBasePath: !!(activeTask.needsBasePath),
+        navCount: (resumeState && typeof resumeState.navCount === 'number') ? resumeState.navCount : 0
+      };
+      lockStoreSet(TASK_RESUME_KEY, JSON.stringify(payload));
+    } catch (e) {}
+  }
+
+  function loadResumeTask() {
+    try {
+      const raw = lockStoreGet(TASK_RESUME_KEY);
+      if (!raw) return null;
+      const data = JSON.parse(raw);
+      if (!data || data.version !== 1 || !Array.isArray(data.results)) return null;
+      if (!data.timestamp || (Date.now() - data.timestamp) > RESUME_TTL_MS) { clearResumeTask(); return null; }
+      return data;
+    } catch (e) { return null; }
+  }
+
+  function clearResumeTask() {
+    try { lockStoreDel(TASK_RESUME_KEY); } catch (e) {}
+    resumeState = null;
+  }
+
+  // 女优/组合模式留空女优名时，列表基准就是当前页面路径
+  function modeNeedsBasePath(mode, inputs) {
+    if (mode === 'current') return true;
+    if (mode === 'actor') {
+      const actorName = (inputs && inputs.actorName ? String(inputs.actorName) : '').trim();
+      if (!actorName) return true;
+      // 有女优名时依赖搜索 / 标签解析，不强制回跳
+      return false;
+    }
+    return false;
+  }
   const BAN_HOST_KEY = "javdb_ban_host";
   const BAN_TIME_KEY = "javdb_ban_time";
   const BAN_TTL_MS = 90000;
@@ -420,7 +512,7 @@
             }
           } catch (e) {}
         });
-      })(__asyncGet, [LOCK_KEY, LOCK_TIME_KEY, DOMAIN_CACHE_KEY, DOMAIN_CACHE_TIME_KEY, DOMAIN_CACHE_SOURCE_KEY, BAN_HOST_KEY, BAN_TIME_KEY]);
+      })(__asyncGet, [LOCK_KEY, LOCK_TIME_KEY, DOMAIN_CACHE_KEY, DOMAIN_CACHE_TIME_KEY, DOMAIN_CACHE_SOURCE_KEY, BAN_HOST_KEY, BAN_TIME_KEY, TASK_RESUME_KEY]);
     }
   } catch (e) {}
   function broadcastBanForCurrentHost() {
@@ -744,6 +836,8 @@
   }
 
   async function triggerDomainJump(reason = '检测到拦截封禁') {
+    // 跳转前先落盘断点：新域名若要求重新登录，登录后可自动继续
+    try { if (isRunning) saveResumeTask(reason); } catch (e) {}
     removeFromQueue();
     document.title = origTitle;
     const currentHost = window.location.hostname.toLowerCase();
@@ -807,6 +901,9 @@
 
     if (logEl) {
       logHtml("✅ 锁定新域名: <b>" + escapeHtml(targetDomain) + "</b> <span style='color:#888;'>(" + escapeHtml(source) + ")</span>，3秒后自动跳转复活...<br>");
+    }
+    if (logEl && isRunning) {
+      logHtml("<span style='color:#8fd3ff;'>💾 已保存抓取断点：新域名如需登录，登录后会自动继续（已抓取结果不会丢失）。</span><br>");
     }
     if (statusEl) {
       statusEl.innerText = `🔄 3秒后跳转至: ${targetDomain}`;
@@ -985,6 +1082,8 @@
   function resetStartButton() {
     btnStart.disabled = false;
     btnStart.textContent = '开始抓取';
+    // 断点只在「封禁跳域」或「需要登录」时保留；其余情况清理
+    if (!loginStopped && !isJumping) { try { clearResumeTask(); } catch (e) {} }
   }
   function scheduleRestartIfNeeded() {
     if (!restartRequested) return;
@@ -1002,6 +1101,8 @@
   }
   function requestRestart() {
     if (!isRunning) { runScraper(); return; }
+    // 用户改了参数重新开始：丢弃旧的断点，按新任务抓取
+    try { clearResumeTask(); } catch (e) {}
     restartRequested = true;
     shouldStop = true;
     btnStart.disabled = true;
@@ -1156,6 +1257,7 @@ btnGotoCode.addEventListener('click', () => {
 
       if (isLoginPage(detailRes.url, detailHtml)) {
         log(`[!] ${movieCode} 即将跳转登录页，请先登录 JavDB 后再执行`);
+        try { if (isRunning) saveResumeTask('需要登录'); } catch (e) {}
         try { shouldStop = true; loginStopped = true; statusEl.innerText = '状态: 请先登录 JavDB 后再抓取'; } catch (e) {}
         return null;
       }
@@ -1268,6 +1370,25 @@ btnGotoCode.addEventListener('click', () => {
     document.title = `⚡[抓取中...] ${origTitle}`;
     statusEl.innerText = '状态: 正在抓取中...';
     const results = [];
+    const doneCodes = new Set();
+    // 恢复断点：已抓磁链 + 已处理番号，results 复用同一数组引用以便自动同步
+    if (resumeState && resumeState.mode === currentMode) {
+      try {
+        (resumeState.results || []).forEach(m => { if (m) results.push(m); });
+        (resumeState.doneCodes || []).forEach(c => { if (c) doneCodes.add(c); });
+        if (results.length || doneCodes.size) {
+          log(`♻️ 断点续抓：已载入 ${results.length} 条磁链，跳过 ${doneCodes.size} 个已处理作品`);
+        }
+      } catch (e) {}
+    }
+    activeTask = { mode: currentMode, results: results, doneCodes: doneCodes, needsBasePath: false };
+    // 运行期间每 5 秒落盘一次断点：意外关闭标签 / 封禁跳域都不丢进度
+    try {
+      const periodic = setInterval(() => {
+        if (!isRunning || !activeTask) { clearInterval(periodic); return; }
+        try { saveResumeTask('定期保存'); } catch (e) {}
+      }, 5000);
+    } catch (e) {}
     const parser = new DOMParser();
     let lastItemStartedAt = 0;
 
@@ -1335,6 +1456,7 @@ btnGotoCode.addEventListener('click', () => {
         let processedTargets = 0;
         let itemsBeforePage = 0;
         let currentPage = currPageStart;
+        if (activeTask) activeTask.needsBasePath = true;
         log('当前列表模式: 起始页码 ' + currPageStart + '，跨页顺序抓取第 ' + rangeStart + '-' + rangeEnd + ' 个作品（共 ' + totalTargets + ' 个）');
 
         while (!shouldStop && !isJumping && currentPage <= 500 && processedTargets < totalTargets) {
@@ -1381,27 +1503,34 @@ btnGotoCode.addEventListener('click', () => {
             for (let idx = 0; idx < pageItems.length; idx++) {
               if (shouldStop || isJumping) break;
               const absolutePosition = takeStart + idx;
-              if (!(await waitForNextItemSlot())) break;
               const item = pageItems[idx];
               const aTag = item.querySelector('a');
-              if (!aTag) {
+              const rawHref = aTag ? aTag.getAttribute('href') : null;
+              if (!rawHref || rawHref.indexOf('/v/') < 0) {
+                if (!(await waitForNextItemSlot())) break;
                 processedTargets++;
                 progressEl.innerText = '进度: (' + processedTargets + '/' + totalTargets + ')';
                 continue;
               }
 
-              const movieHref = aTag.getAttribute('href');
-              if (!movieHref || movieHref.indexOf('/v/') < 0) {
-                processedTargets++;
-                progressEl.innerText = '进度: (' + processedTargets + '/' + totalTargets + ')';
-                continue;
-              }
-              const codeEl = item.querySelector('.uid') || item.querySelector('strong');
-              const movieCode = codeEl ? codeEl.textContent.trim() : ('作品' + absolutePosition);
+              const codeEl0 = item.querySelector('.uid') || item.querySelector('strong');
+              const movieCode0 = codeEl0 ? codeEl0.textContent.trim() : ('作品' + absolutePosition);
 
               processedTargets++;
               progressEl.innerText = '进度: (' + processedTargets + '/' + totalTargets + ')';
               document.title = '⚡[抓取 ' + processedTargets + '/' + totalTargets + '] ' + origTitle;
+
+              // 断点续抓：已处理过的番号直接跳过详情页请求
+              if (doneCodes.has(movieCode0)) {
+                log(`↩️ 已处理，跳过: ${movieCode0}`);
+                continue;
+              }
+
+              if (!(await waitForNextItemSlot())) break;
+
+              const movieHref = rawHref;
+              const codeEl = item.querySelector('.uid') || item.querySelector('strong');
+              const movieCode = codeEl ? codeEl.textContent.trim() : ('作品' + absolutePosition);
               log('提取中: 第' + absolutePosition + '个 ' + movieCode + '...');
 
               const magnet = await processDetailPage(movieHref, movieCode);
@@ -1409,6 +1538,7 @@ btnGotoCode.addEventListener('click', () => {
                 await triggerDomainJump('抓取中遭遇域名拦截');
                 break;
               }
+              doneCodes.add(movieCode);
               if (magnet) results.push(magnet);
             }
           }
@@ -1438,10 +1568,22 @@ btnGotoCode.addEventListener('click', () => {
         let domainJumped = false;
         for (let i = startNum; i <= endNum; i++) {
           if (shouldStop || domainJumped) break;
-          if (!(await waitForNextItemSlot())) break;
 
           const rawNumStr = String(i);
           const pad3Str = rawNumStr.padStart(3, '0');
+          const unitCode = `${basePrefix}-${pad3Str}`;
+          const currentIdx = i - startNum + 1;
+
+          progressEl.innerText = `进度: ${currentIdx} / ${totalCount} (${unitCode})`;
+          document.title = `⚡[抓取 ${currentIdx}/${totalCount}] ${origTitle}`;
+
+          // 断点续抓：已处理过的番号直接跳过搜索与详情请求
+          if (doneCodes.has(unitCode)) {
+            log(`↩️ 已处理，跳过: ${unitCode}`);
+            continue;
+          }
+
+          if (!(await waitForNextItemSlot())) break;
 
           const searchTerms = [...new Set([
             `${basePrefix}-${pad3Str}`,
@@ -1449,9 +1591,6 @@ btnGotoCode.addEventListener('click', () => {
             `${basePrefix}${pad3Str}`
           ])];
 
-          const currentIdx = i - startNum + 1;
-          progressEl.innerText = `进度: ${currentIdx} / ${totalCount} (${basePrefix}-${pad3Str})`;
-          document.title = `⚡[抓取 ${currentIdx}/${totalCount}] ${origTitle}`;
           log(`检索中: ${basePrefix}-${pad3Str}...`);
 
           let targetMovieLink = null;
@@ -1498,9 +1637,10 @@ btnGotoCode.addEventListener('click', () => {
 
           if (!targetMovieLink) {
             log(`[-] ${basePrefix}-${pad3Str} 不存在/未录入`);
+            doneCodes.add(unitCode);
           } else {
             const absLink = toAbsoluteUrl(targetMovieLink);
-            const magnet = await processDetailPage(absLink, `${basePrefix}-${pad3Str}`);
+            const magnet = await processDetailPage(absLink, unitCode);
 
             if (magnet === 'IP_BANNED') {
               await triggerDomainJump('抓取详情遭遇域名拦截');
@@ -1508,6 +1648,7 @@ btnGotoCode.addEventListener('click', () => {
               break;
             }
 
+            doneCodes.add(unitCode);
             if (magnet) results.push(magnet);
           }
         }
@@ -1522,6 +1663,7 @@ btnGotoCode.addEventListener('click', () => {
         if (!Number.isInteger(inputStartPage) || !Number.isInteger(inputEndPage) || inputStartPage < 1 || inputEndPage < 1 || inputStartPage > 500 || inputEndPage > 500) { alert("请检查正确的页码范围！"); resetStartButton(); btnStop.disabled = true; isRunning = false; removeFromQueue(); document.title = origTitle; return; }
 
         const useCurrentList = !actorName;
+        if (activeTask) activeTask.needsBasePath = modeNeedsBasePath('actor', { actorName: actorName });
         let baseCategoryUrl = null;
         if (!useCurrentList) {
           // 女优/组合模式：先进入女优主页，再进入女优页上的类型分类，最后抓取分类列表。
@@ -1746,7 +1888,6 @@ btnGotoCode.addEventListener('click', () => {
 
             for (let idx = 0; idx < movieItems.length; idx++) {
               if (shouldStop) break;
-              if (!(await waitForNextItemSlot())) break;
               const item = movieItems[idx];
               processedTargets++;
               progressEl.innerText = `进度: 页 ${page} (${processedTargets}/${totalTargets})`;
@@ -1759,6 +1900,11 @@ btnGotoCode.addEventListener('click', () => {
               const codeEl = item.querySelector('.uid') || item.querySelector('strong');
               const movieCode = codeEl ? codeEl.textContent.trim() : `作品${idx + 1}`;
 
+              // 断点续抓：已处理过的番号直接跳过详情页请求
+              if (doneCodes.has(movieCode)) continue;
+
+              if (!(await waitForNextItemSlot())) break;
+
               log(`检查标签中: ${movieCode}...`);
 
               const magnet = await processDetailPage(movieHref, movieCode);
@@ -1769,6 +1915,7 @@ btnGotoCode.addEventListener('click', () => {
                 break;
               }
 
+              doneCodes.add(movieCode);
               if (magnet) results.push(magnet);
             }
           } catch (e) { log(`[!] 第 ${page} 页抓取失败`); }
@@ -1781,11 +1928,14 @@ btnGotoCode.addEventListener('click', () => {
     } finally {
       document.title = origTitle;
       isRunning = false;
+      activeTask = null;
       removeFromQueue();
       if (!isJumping && restartRequested) scheduleRestartIfNeeded();
     }
 
     if (isJumping) return; // jump pending: keep jump status, skip re-enable
+    // 断点只在「封禁跳域」或「需要登录」时保留；其余情况清理
+    if (!loginStopped) { try { clearResumeTask(); } catch (e) {} }
     statusEl.style.color = '';
     statusEl.innerText = banStopped ? '状态: 同域封禁广播，已停止排队' : tagFailed ? '状态: 标签解析失败' : loginStopped ? '状态: 请先登录 JavDB 后再抓取' : (shouldStop ? '状态: 已手动停止' : '状态: 完成！');
     resetStartButton(); btnStop.disabled = true;
@@ -1808,20 +1958,132 @@ btnGotoCode.addEventListener('click', () => {
     log(`📁 导出成功：${fileNameTag}_迅雷专用.txt`);
   }
 
-  btnStart.onclick = () => {
-    if (!isRunning) runScraper();
-    else requestRestart();
-  };
-  btnStop.onclick = () => { if (isRunning) { shouldStop = true; statusEl.innerText = '状态: 正在停止...'; } };
+  // 面板参数与断点记录完全一致时视为「继续抓取」，否则视为新任务
+  function panelMatchesResume() {
+    if (!resumeState || !resumeState.inputs) return false;
+    if (resumeState.mode !== currentMode) return false;
+    const now = collectPanelInputs();
+    for (const key in RESUME_FIELD_MAP) {
+      const a = now[key] === undefined ? '' : String(now[key]);
+      const b = resumeState.inputs[key] === undefined ? '' : String(resumeState.inputs[key]);
+      if (a !== b) return false;
+    }
+    return true;
+  }
+
+  function startFromPanel() {
+    if (!isRunning) {
+      // 参数已改动 -> 视为新任务，丢弃旧断点
+      if (!panelMatchesResume()) { try { clearResumeTask(); } catch (e) {} }
+      runScraper();
+    } else {
+      requestRestart();
+    }
+  }
+
+  btnStart.onclick = () => { startFromPanel(); };
+  btnStop.onclick = () => { if (isRunning) { try { clearResumeTask(); } catch (e) {} shouldStop = true; statusEl.innerText = '状态: 正在停止...'; } };
 
   const handleEnterKey = (e) => {
     if (e.key === 'Enter') {
       e.preventDefault();
-      if (!isRunning) runScraper();
-      else requestRestart();
+      startFromPanel();
     }
   };
   document.querySelectorAll('#javdb-scraper-panel input').forEach(input => {
     input.addEventListener('keydown', handleEnterKey);
   });
+
+  // —— 页面加载后的断点自动恢复（封禁跳域 + 重新登录后续抓）——
+  function applyResumeMode(mode) {
+    if (!mode) return;
+    currentMode = mode;
+    document.querySelectorAll('input[name="scraper-mode"]').forEach(r => { r.checked = (r.value === mode); });
+    const sC = document.getElementById('section-current');
+    const sK = document.getElementById('section-code');
+    const sA = document.getElementById('section-actor');
+    if (sC) sC.style.display = mode === 'current' ? 'flex' : 'none';
+    if (sK) sK.style.display = mode === 'code' ? 'flex' : 'none';
+    if (sA) sA.style.display = mode === 'actor' ? 'flex' : 'none';
+  }
+
+  function isStillLoginPage() {
+    try {
+      return isLoginPage(window.location.href, document.documentElement ? document.documentElement.innerHTML : '');
+    } catch (e) { return false; }
+  }
+
+  function beginResumeTask() {
+    if (isRunning || !resumeState) return;
+    // 保留 resumeState，让 runScraper 载入已抓磁链与已处理番号
+    runScraper();
+  }
+
+  function scheduleResumeWatch() {
+    if (resumeAutoTimer) clearInterval(resumeAutoTimer);
+    let ticks = 0;
+    resumeAutoTimer = setInterval(() => {
+      ticks++;
+      if (isRunning) { clearInterval(resumeAutoTimer); resumeAutoTimer = null; return; }
+      if (ticks % 2 === 0) autoCheckRememberMe();
+      if (!isStillLoginPage() || ticks > 300) {
+        clearInterval(resumeAutoTimer);
+        resumeAutoTimer = null;
+        if (!isStillLoginPage()) {
+          logHtml("<span style='color:#8fd3ff;'>✅ 登录已完成，正在恢复未完成的抓取任务...</span><br>");
+          beginResumeTask();
+        }
+      }
+    }, 1000);
+  }
+
+  function tryAutoResume() {
+    let data = null;
+    try { data = loadResumeTask(); } catch (e) {}
+    if (!data) return;
+    if ((Date.now() - data.timestamp) > AUTO_RESUME_TTL_MS) {
+      statusEl.innerText = '状态: 检测到未完成任务，可点「继续抓取」接着抓';
+      btnStart.textContent = '继续抓取';
+      logHtml("<br><span style='color:#ffcc00;'>♻️ 检测到未完成任务（已抓 " + (data.results || []).length + " 条磁链）。断点已超过 20 分钟，点「继续抓取」即可接着抓。</span><br>");
+      return;
+    }
+    resumeState = data;
+    applyPanelInputs(data.inputs);
+    applyResumeMode(data.mode);
+    btnStart.textContent = '继续抓取';
+
+    const modeLabel = data.mode === 'current' ? '当前列表' : (data.mode === 'code' ? '番号段' : '女优/组合');
+    logHtml("<br><span style='color:#ffcc00; font-weight:bold;'>♻️ 检测到未完成的抓取任务（" + escapeHtml(modeLabel) + "），已恢复参数与 " + (data.results || []).length + " 条已抓磁链 / " + (data.doneCodes || []).length + " 个已处理作品。</span><br>");
+
+    if (isStillLoginPage()) {
+      statusEl.innerText = '状态: 检测到未完成任务，请先登录 JavDB，登录后将自动继续';
+      statusEl.style.color = '#ffcc00';
+      logHtml("<span style='color:#ffcc00;'>🔑 当前页面需要登录，请完成登录（脚本会自动勾选「记住我」），登录后任务会自动继续。</span><br>");
+      scheduleResumeWatch();
+      return;
+    }
+
+    // 依赖原页面路径的模式（当前列表 / 空女优名的分类页）先回到原路径
+    if (data.needsBasePath && data.basePath && currentBasePath() !== data.basePath) {
+      const navCount = (typeof data.navCount === 'number') ? data.navCount : 0;
+      if (navCount < 1) {
+        data.navCount = navCount + 1;
+        resumeState = data;
+        try { lockStoreSet(TASK_RESUME_KEY, JSON.stringify(data)); } catch (e) {}
+        statusEl.innerText = '状态: 正在返回原抓取页面，随后自动继续...';
+        logHtml("<span style='color:#8fd3ff;'>↩️ 正在返回原抓取页面: " + escapeHtml(data.basePath) + "</span><br>");
+        resumeAutoTimer = setTimeout(() => {
+          try { location.href = location.origin + data.basePath; } catch (e) {}
+        }, 1200);
+        return;
+      }
+    }
+
+    statusEl.innerText = '状态: 检测到未完成任务，3 秒后自动继续...';
+    logHtml("<span style='color:#8fd3ff;'>⏳ 3 秒后自动继续未完成的抓取任务（想重新开始可直接改参数后点「重新开始」）...</span><br>");
+    if (resumeAutoTimer) clearTimeout(resumeAutoTimer);
+    resumeAutoTimer = setTimeout(() => { beginResumeTask(); }, 3000);
+  }
+
+  try { tryAutoResume(); } catch (e) {}
 })();
