@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.15.0
+// @version      5.15.1
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置全自动自适应请求间隔（根据响应速度与限流情况自动提速降速，无需手动选择速度）；内置 429/封禁重试、备用域名自动切换与多标签排队保护；封禁跳转到新域名并重新登录后自动断点续抓（保留已抓磁链与进度）；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -33,7 +33,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.15.0';
+  const SCRIPT_VERSION = '5.15.1';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -2215,7 +2215,15 @@ btnGotoCode.addEventListener('click', () => {
     const valid = [...new Set(magnets.filter(m => m && m.toLowerCase().startsWith('magnet:?')))];
     if (valid.length === 0) { log('⚠️ 未抓取到有效磁链'); return; }
 
-    const blob = new Blob([valid.join("\r\n")], { type: 'text/plain;charset=utf-8;' });
+    // 每满 100 条空一行分组，方便在迅雷里分段查看；
+    // 只影响导出文本排版，去重结果与条数不变（迅雷导入会忽略空行）。
+    const TXT_GROUP_SIZE = 100;
+    const groups = [];
+    for (let i = 0; i < valid.length; i += TXT_GROUP_SIZE) {
+      groups.push(valid.slice(i, i + TXT_GROUP_SIZE).join("\r\n"));
+    }
+    const content = groups.join("\r\n\r\n");
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
@@ -2224,7 +2232,7 @@ btnGotoCode.addEventListener('click', () => {
     link.click();
     document.body.removeChild(link);
     setTimeout(function() { try { URL.revokeObjectURL(url); } catch(e) {} }, 60000);
-    log(`📁 导出成功：${fileNameTag}_迅雷专用.txt`);
+    log(`📁 导出成功：${fileNameTag}_迅雷专用.txt（共 ${valid.length} 条${groups.length > 1 ? `，按每 ${TXT_GROUP_SIZE} 条空行分组，共 ${groups.length} 组` : ''}）`);
   }
 
   // 面板参数与断点记录完全一致时视为「继续抓取」，否则视为新任务
