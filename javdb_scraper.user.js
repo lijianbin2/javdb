@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.14.0
+// @version      5.14.1
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT；内置激进/标准/保守三档速度与自适应请求间隔（连续成功自动提速，遇到限流自动降速）；内置 429/封禁重试、备用域名自动切换与多标签排队保护；封禁跳转到新域名并重新登录后自动断点续抓（保留已抓磁链与进度）；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动跳过 登录图形验证码自动识别+VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -33,7 +33,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.14.0';
+  const SCRIPT_VERSION = '5.14.1';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -580,7 +580,7 @@
             }
           } catch (e) {}
         });
-      })(__asyncGet, [LOCK_KEY, LOCK_TIME_KEY, DOMAIN_CACHE_KEY, DOMAIN_CACHE_TIME_KEY, DOMAIN_CACHE_SOURCE_KEY, BAN_HOST_KEY, BAN_TIME_KEY, TASK_RESUME_KEY]);
+      })(__asyncGet, [LOCK_KEY, LOCK_TIME_KEY, DOMAIN_CACHE_KEY, DOMAIN_CACHE_TIME_KEY, DOMAIN_CACHE_SOURCE_KEY, BAN_HOST_KEY, BAN_TIME_KEY, TASK_RESUME_KEY, DEAD_DOMAIN_KEY, JUMP_ATTEMPT_KEY]);
     }
   } catch (e) {}
   function broadcastBanForCurrentHost() {
@@ -606,11 +606,13 @@
   }
 
 
-  function gmGet(url) {
+  function gmGet(url, timeoutMs) {
+    const cap = (timeoutMs && timeoutMs > 0) ? Math.min(timeoutMs, 10000) : 10000;
+    const reqTimeout = (timeoutMs && timeoutMs > 0) ? Math.max(1500, Math.min(timeoutMs, 8000)) : 8000;
     return new Promise((resolve) => {
       let gmSettled = false;
       const gmDone = (v) => { if (!gmSettled) { gmSettled = true; try { clearTimeout(gmTimer); } catch (e2) {} resolve(v); } };
-      const gmTimer = setTimeout(() => gmDone(null), 10000);
+      const gmTimer = setTimeout(() => gmDone(null), cap);
       const request = (typeof GM_xmlhttpRequest !== 'undefined' && GM_xmlhttpRequest) ||
         (typeof GM !== 'undefined' && GM.xmlHttpRequest) || null;
       if (!request) {
@@ -621,7 +623,7 @@
         request({
           method: 'GET',
           url: url,
-          timeout: 8000,
+          timeout: reqTimeout,
           onload: function (response) { gmDone(response); },
           onerror: function () { gmDone(null); },
           ontimeout: function () { gmDone(null); }
@@ -691,6 +693,124 @@
       }
     } catch(e){}
     return out;
+  }
+
+  // —— 失效域名记忆 ——
+  // 跳转前不再盲信缓存/算号递减：先探测是否真的可访问。
+  // 刚探测失败的域名记入黑名单一段时间，避免反复跳到同一个死域名（来回弹跳）。
+  const DEAD_DOMAIN_KEY = 'javdb_dead_domains';
+  const DEAD_DOMAIN_TTL_MS = 2 * 60 * 60 * 1000; // 失效记忆 2 小时
+
+  function getDeadDomains() {
+    try {
+      const raw = lockStoreGet(DEAD_DOMAIN_KEY);
+      if (!raw) return {};
+      const obj = JSON.parse(raw);
+      if (!obj || typeof obj !== 'object') return {};
+      const now = Date.now();
+      const out = {};
+      let changed = false;
+      for (const k in obj) {
+        if (now - Number(obj[k]) < DEAD_DOMAIN_TTL_MS) out[k] = Number(obj[k]);
+        else changed = true;
+      }
+      if (changed) { try { lockStoreSet(DEAD_DOMAIN_KEY, JSON.stringify(out)); } catch (e) {} }
+      return out;
+    } catch (e) { return {}; }
+  }
+
+  function markDomainDead(domain, reason) {
+    if (!domain) return;
+    try {
+      const dead = getDeadDomains();
+      const prev = dead[String(domain).toLowerCase()] || 0;
+      // 连续失败会延长记忆，但不超过 TTL 的 3 倍
+      const until = Date.now() + DEAD_DOMAIN_TTL_MS * Math.min(3, 1 + (prev ? 1 : 0));
+      dead[String(domain).toLowerCase()] = until;
+      lockStoreSet(DEAD_DOMAIN_KEY, JSON.stringify(dead));
+    } catch (e) {}
+  }
+
+  function isDomainKnownDead(domain) {
+    if (!domain) return false;
+    try { return !!getDeadDomains()[String(domain).toLowerCase()]; } catch (e) { return false; }
+  }
+
+  function clearDomainDeadMark(domain) {
+    if (!domain) return;
+    try {
+      const dead = getDeadDomains();
+      const k = String(domain).toLowerCase();
+      if (dead[k]) { delete dead[k]; lockStoreSet(DEAD_DOMAIN_KEY, JSON.stringify(dead)); }
+    } catch (e) {}
+  }
+
+  // 轻量探测：确认目标域名当前真的能打开，且不是封禁/停放页
+  function hasGmRequest() {
+    try {
+      return !!((typeof GM_xmlhttpRequest !== 'undefined' && GM_xmlhttpRequest) ||
+                (typeof GM !== 'undefined' && GM && GM.xmlHttpRequest));
+    } catch (e) { return false; }
+  }
+  async function probeDomain(domain) {
+    const d = String(domain || '').toLowerCase();
+    if (!/^javdb\d*\.(com|org|net)$/.test(d) && d !== 'javdb.com') return { alive: false, reason: '域名格式不合法' };
+    // 没有跨域请求能力时无法探测，此时不要因为探测失败而阻断跳转
+    if (!hasGmRequest()) return { alive: true, reason: 'no-probe' };
+    const resp = await gmGet('https://' + d + '/', 5000);
+    if (!resp) return { alive: false, reason: '无法连接（超时/网络错误）' };
+    const status = Number(resp.status) || 0;
+    if (status === 0) return { alive: false, reason: '无响应' };
+    if (status >= 500) return { alive: false, reason: '服务器错误 ' + status };
+    if (isBannedPage(status, resp.responseText)) return { alive: false, reason: '该域名已被封禁' };
+    const body = String(resp.responseText || '');
+    // 停放页 / 域名回收后的默认页
+    if (body.length < 200 && !/javdb/i.test(body)) return { alive: false, reason: '疑似停放页' };
+    return { alive: true, reason: 'ok', status: status };
+  }
+
+  // —— 连续跳域次数限制（防止反复跳到死域名形成死循环）——
+  const JUMP_ATTEMPT_KEY = 'javdb_jump_attempts';
+  const JUMP_ATTEMPT_MAX = 4;
+  const JUMP_ATTEMPT_WINDOW_MS = 20 * 60 * 1000;
+
+  function getJumpAttempts() {
+    try {
+      const raw = lockStoreGet(JUMP_ATTEMPT_KEY);
+      if (!raw) return { n: 0, t: 0 };
+      const o = JSON.parse(raw);
+      if (!o || typeof o !== 'object') return { n: 0, t: 0 };
+      if ((Date.now() - Number(o.t || 0)) > JUMP_ATTEMPT_WINDOW_MS) return { n: 0, t: Date.now() };
+      return { n: Number(o.n) || 0, t: Number(o.t) || 0 };
+    } catch (e) { return { n: 0, t: 0 }; }
+  }
+
+  function bumpJumpAttempts() {
+    try {
+      const a = getJumpAttempts();
+      a.n += 1;
+      a.t = Date.now();
+      lockStoreSet(JUMP_ATTEMPT_KEY, JSON.stringify(a));
+      return a.n;
+    } catch (e) { return 1; }
+  }
+
+  function clearJumpAttempts() {
+    try { lockStoreDel(JUMP_ATTEMPT_KEY); } catch (e) {}
+  }
+
+  // 判断当前页面是否真的是 JavDB 站点（停放页/域名回收页会被判否）
+  function looksLikeJavDBPage() {
+    try {
+      if (isLoginPage(window.location.href, '')) return true; // 登录页也算正常
+      if (document.querySelector('.movie-list')) return true;
+      if (document.querySelector('a[href*="/v/"]')) return true;
+      if (document.querySelector('a[href*="/actors/"], a[href*="/video_codes/"], a[href*="/tags"]')) return true;
+      const t = document.body ? (document.body.innerText || '') : '';
+      if (/javdb|磁力|番号|女优|影片|影片庫/i.test(t.slice(0, 4000))) return true;
+      if (document.title && /javdb/i.test(document.title)) return true;
+    } catch (e) {}
+    return false;
   }
 
   async function fetchLatestDomainFromJavdb() {
@@ -921,31 +1041,68 @@
       statusEl.style.color = '#ffcc00';
     }
 
-    // 优先用缓存/实时多源
+    // 候选顺序：实时多源 -> 缓存 -> 算号/静态兜底
+    // 注意：不再让「24h 内的缓存」直接短路实时校验，缓存里的域名可能早已失效。
     let targetDomain = null;
     let source = '';
+    const candidates = [];
+    const pushCand = (d, s) => {
+      if (!d) return;
+      const v = String(d).toLowerCase();
+      if (v === currentHost) return;
+      if (!candidates.some(c => c.domain === v)) candidates.push({ domain: v, source: s });
+    };
+
+    // 1) 实时多源（封禁后正在等待，限制 9 秒，避免长时间卡住不跳转）
+    let live = null;
+    try {
+      live = await new Promise((resolve) => {
+        let done = false;
+        const fin = (v) => { if (!done) { done = true; resolve(v); } };
+        setTimeout(() => fin(null), 9000);
+        Promise.resolve(fetchLatestDomainMultiSource()).then(fin, () => fin(null));
+      });
+    } catch (e) { live = null; }
+    if (live && live.domain) { pushCand(live.domain, '实时:' + live.source); setCachedDomain(live.domain, live.source); }
+
+    // 2) 缓存
     const cached = getCachedDomain();
-    // 若缓存新鲜（24h内）直接用
-    if (cached && (Date.now() - cached.time) < 24*3600000) {
-      if (cached.domain !== currentHost) { targetDomain = cached.domain; source = '缓存:'+cached.source; }
+    if (cached) pushCand(cached.domain, '缓存:' + cached.source);
+
+    // 3) 算号递减 + 静态备用列表
+    const fallbackList = buildBackupDomainList((live && live.domain) ? live.domain : (cached ? cached.domain : null));
+    for (const d of fallbackList) pushCand(d, '兜底列表');
+    if (!candidates.length) STATIC_BACKUP_DOMAINS.forEach(z => pushCand(z, '静态兜底'));
+
+    // 4) 逐个探测，只跳到确认可用的域名
+    if (logEl && candidates.length) {
+      logHtml("🔍 共 " + candidates.length + " 个候选域名，逐个验证可用性后再跳转...<br>");
     }
-    if (!targetDomain) {
-      const res = await fetchLatestDomainMultiSource();
-      if (res && res.domain && res.domain !== currentHost) { targetDomain = res.domain; source = res.source; setCachedDomain(res.domain, res.source); }
-      else if (cached && cached.domain !== currentHost) { targetDomain = cached.domain; source = '缓存兜底'; }
+    let probeList = candidates.filter(c => !isDomainKnownDead(c.domain));
+    if (!probeList.length && candidates.length) {
+      // 全部候选都在失效记忆里：清空记忆重新验证一次，避免彻底卡死
+      try { lockStoreDel(DEAD_DOMAIN_KEY); } catch (e) {}
+      probeList = candidates.slice();
+      if (logEl) logHtml("<span style='color:#ffcc00;'>⚠️ 候选域名全部在失效记忆中，已清空记忆并重新验证。</span><br>");
     }
 
-    // 算号退回 + 备用列表兜底
-    if (!targetDomain || targetDomain === currentHost) {
-      const backupList = buildBackupDomainList(targetDomain || (cached?cached.domain:null));
-      let idx = backupList.findIndex(d => d === currentHost);
-      if (idx >= 0 && idx + 1 < backupList.length) targetDomain = backupList[idx+1];
-      else {
-        const m = currentHost.match(/javdb(\d+)\.com/);
-        if (m) targetDomain = `javdb${Math.max(parseInt(m[1],10)-1,1)}.com`;
-        else targetDomain = backupList[0] || STATIC_BACKUP_DOMAINS[0];
+    for (const c of probeList) {
+      const r = await probeDomain(c.domain);
+      if (r.alive) {
+        targetDomain = c.domain;
+        source = c.source;
+        try { clearDomainDeadMark(c.domain); } catch (e) {}
+        break;
       }
-      source = source || '递减兜底';
+      try { markDomainDead(c.domain, r.reason); } catch (e) {}
+      if (logEl) {
+        logHtml("🚫 跳过 <b>" + escapeHtml(c.domain) + "</b>（" + escapeHtml(r.reason || '不可用') + "）<br>");
+      }
+    }
+
+    if (logEl) {
+      const deadN = Object.keys(getDeadDomains()).length;
+      if (deadN) logHtml("<span style='color:#888;'>📋 失效域名记录：" + deadN + " 个（两小时内不再尝试）</span><br>");
     }
 
     if (!targetDomain || targetDomain === currentHost) {
@@ -975,6 +1132,20 @@
     }
     if (statusEl) {
       statusEl.innerText = `🔄 3秒后跳转至: ${targetDomain}`;
+    }
+
+    // 连续跳域过多（说明备用域名大面积失效）时停下，避免无限跳
+    const jumpNo = bumpJumpAttempts();
+    if (jumpNo > JUMP_ATTEMPT_MAX) {
+      clearJumpAttempts();
+      try { markDomainDead(targetDomain, '连续跳域次数过多'); } catch (e) {}
+      if (logEl) {
+        logHtml("<br><span style='color:#ff5555; font-weight:bold;'>⚠️ 20 分钟内已连续切换 " + JUMP_ATTEMPT_MAX + " 次域名仍未稳定，已停止自动跳转。请手动打开可用的 JavDB 地址后再继续（已抓取进度已保存）。</span><br>");
+      }
+      if (statusEl) { statusEl.innerText = '状态: 备用域名连续失效，已停止跳转'; statusEl.style.color = '#ff5555'; }
+      try { banStopped = true; shouldStop = true; } catch (e) {}
+      isJumping = false;
+      return;
     }
 
     isJumping = true;
@@ -1011,6 +1182,18 @@
     triggerDomainJump('访问被拦截');
     return;
   }
+
+  // 自愈：刚跳过来却不是 JavDB 页面（域名失效/停放页）时，记为失效并继续换域名
+  try {
+    if (getJumpAttempts().n >= 1 && !looksLikeJavDBPage()) {
+      markDomainDead(window.location.hostname.toLowerCase(), '跳转后页面不是 JavDB 站点');
+      triggerDomainJump('跳转到已失效的网址');
+      return;
+    }
+    // 当前页面正常，清除失效标记与连续跳域计数
+    clearDomainDeadMark(window.location.hostname.toLowerCase());
+    clearJumpAttempts();
+  } catch (e) {}
 
   const oldPanel = document.getElementById('javdb-scraper-panel');
   if (oldPanel) oldPanel.remove();
