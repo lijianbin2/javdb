@@ -4,7 +4,7 @@
 
 脚本支持**当前列表**、**番号段**和**女优/组合**三种抓取模式，可以自动筛选磁链、去除重复结果，并导出迅雷专用 TXT 文件。
 
-- 当前版本：`5.15.1`
+- 当前版本：`5.15.3`
 - 支持站点：JavDB 页面
 - 运行环境：Chrome、Edge、Firefox 等支持 Tampermonkey 的浏览器
 
@@ -32,10 +32,20 @@
 1. 在浏览器中安装 [Tampermonkey](https://www.tampermonkey.net/) 扩展。
 2. 打开以下脚本地址：
 
-   [安装 JavDB 万能磁链提取器](https://raw.githubusercontent.com/lijianbin2/javdb/main/javdb_scraper.user.js)
+   [安装 JavDB 万能磁链提取器（Greasy Fork）](https://update.greasyfork.org/scripts/598050/JavDB%20%E4%B8%87%E8%83%BD%E7%A3%81%E9%93%BE%E6%8F%90%E5%8F%96%E5%99%A8.user.js)
 
 3. 在 Tampermonkey 安装页面中点击“安装”。
 4. 安装后刷新任意 JavDB 页面，右下角应显示抓取面板。
+
+脚本主页：[Greasy Fork](https://greasyfork.org/zh-CN/scripts/598050-javdb-%E4%B8%87%E8%83%BD%E7%A3%81%E9%93%BE%E6%8F%90%E5%8F%96%E5%99%A8)
+
+### 使用 GitHub 远程安装（备用）
+
+仓库地址：[github.com/lijianbin2/javdb](https://github.com/lijianbin2/javdb)
+
+   [安装 JavDB 万能磁链提取器（GitHub Raw）](https://raw.githubusercontent.com/lijianbin2/javdb/main/javdb_scraper.user.js)
+
+请优先使用 Greasy Fork 安装：脚本的自动更新源已切换到 Greasy Fork，更新通道更稳定。
 
 ### 本地安装
 
@@ -48,11 +58,11 @@
 脚本已配置以下更新地址：
 
 ```text
-@updateURL   https://raw.githubusercontent.com/lijianbin2/javdb/main/javdb_scraper.user.js
-@downloadURL https://raw.githubusercontent.com/lijianbin2/javdb/main/javdb_scraper.user.js
+@updateURL   https://update.greasyfork.org/scripts/598050/JavDB%20%E4%B8%87%E8%83%BD%E7%A3%81%E9%93%BE%E6%8F%90%E5%8F%96%E5%99%A8.user.js
+@downloadURL https://update.greasyfork.org/scripts/598050/JavDB%20%E4%B8%87%E8%83%BD%E7%A3%81%E9%93%BE%E6%8F%90%E5%8F%96%E5%99%A8.user.js
 ```
 
-在 Tampermonkey 中确认该脚本已开启“自动更新”，安装后即可接收后续版本。
+更新源已切换到 Greasy Fork，从 Greasy Fork 安装的脚本会直接从 Greasy Fork 拉取新版本。在 Tampermonkey 中确认该脚本已开启“自动更新”，即可接收后续版本。
 
 ## 使用方法
 
@@ -333,9 +343,23 @@ JavDB 域名可能发生变化。脚本每 6 小时尝试同步一次最新可�
 
 保持 Tampermonkey 自动更新开启，或手动打开下面的远程脚本地址重新安装：
 
-[查看最新版脚本](https://raw.githubusercontent.com/lijianbin2/javdb/main/javdb_scraper.user.js)
+[在 Greasy Fork 查看最新版脚本](https://greasyfork.org/zh-CN/scripts/598050-javdb-%E4%B8%87%E8%83%BD%E7%A3%81%E9%93%BE%E6%8F%90%E5%8F%96%E5%99%A8)
+
+备用源：[GitHub Raw](https://raw.githubusercontent.com/lijianbin2/javdb/main/javdb_scraper.user.js)
 
 ## 更新记录
+
+### 5.15.3
+
+- 脚本已发布到 Greasy Fork（脚本 ID `598050`）。
+- `@updateURL` 与 `@downloadURL` 由 GitHub Raw 切换为 Greasy Fork 地址，更新通道更稳定。
+- 修正 `@description` 中错乱的描述文字，补充“每 100 条空行分组”说明。
+- 新增 `@homepageURL` 与 `@supportURL` 元数据。
+
+### 5.15.2
+
+- 修复 `@description` 描述文字错乱的问题。
+- 新增 `@homepageURL` 与 `@supportURL` 元数据。
 
 ### 5.15.1
 
