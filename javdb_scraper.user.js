@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.15.3
+// @version      5.15.4
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT（每 100 条空行分组）；内置全自动自适应请求间隔（根据响应速度与限流情况自动提速降速，无需手动选择速度）；内置 429/封禁重试、备用域名自动切换与多标签排队保护；封禁跳转到新域名并重新登录后自动断点续抓（保留已抓磁链与进度）；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动识别登录图形验证码；自动跳过 VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -35,7 +35,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.15.3';
+  const SCRIPT_VERSION = '5.15.4';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -1452,6 +1452,13 @@ btnGotoCode.addEventListener('click', () => {
   const DUR_LABELS = "(?:時長|时长|長度|长度|片長|片长|時間|时间|Length|Duration|Time)";
   const DUR_HM_RE = new RegExp(DUR_LABELS + "[\s\S]{0,40}?(\d+)\s*(?:小時|小时|時|时|h(?:ours?|r)?)\s*(?:(\d+)\s*(?:分鍾|分鐘|分钟|分|min(?:ute)?s?))?", "i");
   const DUR_M_RE = new RegExp(DUR_LABELS + "[\s\S]{0,40}?(\d+)\s*(?:分鍾|分鐘|分钟|分|min(?:ute)?s?)", "i");
+  // 时长标签：strict 用于精确匹配整块标签，loose 用于「影片时长」这类带前缀的写法
+  const DUR_LABEL_STRICT_RE = /^(?:時長|时长|長度|长度|片長|片长|時間|时间|length|duration|runtime|play\s*time|time)$/i;
+  const DUR_LABEL_LOOSE_RE = /(?:時長|时长|長度|长度|片長|片长|時間|时间|length|duration|runtime)/i;
+  // 「3:59」「03:59:59」这类钟表格式
+  const DUR_CLOCK_RE = /(\d{1,3})\s*[:：]\s*(\d{1,2})(?:\s*[:：]\s*(\d{1,2}))?/;
+  // 分类标签里的超长合集标记（JavDB 自带，例如「4小時以上作品」）
+  const LONG_COMPILATION_TAG_RE = /(?:^|[^0-9])(?:4|四)\s*(?:小時|小时|时|h)\s*(?:以上|或以上)/i;
 
   const SUB_C_RE = /-C(?![A-Z0-9])/;
   const SIZE_RE = /([\d\.]+)\s*(TB|GB|MB|KB|B)/;
@@ -1459,21 +1466,10 @@ btnGotoCode.addEventListener('click', () => {
   const VR_CAT_RE = /^(?:類別|类别|分類|分类|categories?|genres?)$/;
   const VR_TOKEN_RE = /(?:^|[^a-z0-9])vr(?:$|[^a-z0-9])/i;
   const NBSP_RE = /\u00A0/g;
-  function parseDurationMin(doc) {
-    const panel = doc.querySelector('.movie-panel-info') || doc.body;
-    const text = (panel.textContent || '').replace(NBSP_RE, " ");
-    const hm = text.match(DUR_HM_RE);
-    if (hm) return parseInt(hm[1], 10) * 60 + (hm[2] ? parseInt(hm[2], 10) : 0);
-    const m = text.match(DUR_M_RE);
-    if (m) return parseInt(m[1], 10);
-    // bare-number fallback removed: it matched counts/dates without a duration label
-    // and wrongly skipped videos. Only label-anchored durations above are trusted.
-    return null;
-  }
-
-  function hasVrCategory(doc) {
+  function getCategoryTokens(doc) {
     const panel = doc.querySelector('.movie-panel-info');
     const blocks = panel ? panel.querySelectorAll('.panel-block') : doc.querySelectorAll('.panel-block');
+    const tokens = [];
 
     for (const block of blocks) {
       const labelEl = block.querySelector('strong');
@@ -1481,11 +1477,120 @@ btnGotoCode.addEventListener('click', () => {
       if (!VR_CAT_RE.test(label)) continue;
 
       const categories = Array.from(block.querySelectorAll('.value a, a'));
-      const hasVr = categories.some(el => VR_TOKEN_RE.test((el.textContent || '').trim()));
-      if (hasVr) return true;
+      categories.forEach(el => tokens.push((el.textContent || '').trim()));
     }
 
-    return false;
+    return tokens;
+  }
+
+  function hasVrCategory(doc) {
+    return getCategoryTokens(doc).some(t => VR_TOKEN_RE.test(t));
+  }
+
+  // 分类里带「4小時以上作品」这类标记时，即使时长字段缺失也判定为超长合集
+  function hasLongCompilationTag(doc) {
+    try {
+      return getCategoryTokens(doc).some(t => LONG_COMPILATION_TAG_RE.test(t));
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function blockValueText(block) {
+    const valueEl = block.querySelector('.value');
+    const raw = (valueEl ? valueEl.textContent : block.textContent) || '';
+    return raw.replace(NBSP_RE, " ").replace(/\s+/g, " ").trim();
+  }
+
+  function labelOfBlock(block) {
+    const labelEl = block.querySelector('strong');
+    return ((labelEl ? labelEl.textContent : '') || '').replace(VR_LABEL_TRIM_RE, "").replace(/\s+/g, " ").trim();
+  }
+
+  // 精确定位「时长」那一块，只取它的值，避免把 日期 / 评分 / 类别 里的数字误当时长
+  function findDurationBlockText(doc) {
+    const panel = doc.querySelector('.movie-panel-info');
+    const root = panel || doc.body;
+    if (!root) return null;
+    let blocks = [];
+    try {
+      blocks = Array.from(root.querySelectorAll('.panel-block'));
+    } catch (e) {
+      return null;
+    }
+    for (const block of blocks) {
+      const label = labelOfBlock(block);
+      if (label && DUR_LABEL_STRICT_RE.test(label)) {
+        const v = blockValueText(block);
+        if (v) return v;
+      }
+    }
+    for (const block of blocks) {
+      const label = labelOfBlock(block);
+      if (label && DUR_LABEL_LOOSE_RE.test(label)) {
+        const v = blockValueText(block);
+        if (v) return v;
+      }
+    }
+    return null;
+  }
+
+  function parseDurationFromValueText(valueText) {
+    const t = String(valueText || '').replace(NBSP_RE, " ").trim();
+    if (!t) return null;
+
+    // 3:59 / 03:59:59 / 239:00
+    const clock = t.match(DUR_CLOCK_RE);
+    if (clock) {
+      const a = parseInt(clock[1], 10);
+      const b = parseInt(clock[2], 10);
+      if (clock[3] !== undefined) return a * 60 + b; // HH:MM:SS
+      // 两段式在时长语境下按 H:MM 解释（3:59 = 3 小时 59 分 = 239 分钟）。
+      // MM:SS 写法在 JavDB 及镜像站从未出现，而本函数的目的是「宁可判长也别漏掉长片」，
+      // 故统一取较大值，避免 3:59 被当成 3 分钟而漏过超长合集。
+      return a * 60 + b;
+    }
+
+    // 3 小時 59 分鐘 / 3h59m / 3 hours 59 minutes
+    const hm = t.match(/(\d+)\s*(?:小時|小时|時|时|h(?:ours?|r)?)\s*(?:(\d+)\s*(?:分鍾|分鐘|分钟|分|min(?:ute)?s?|m(?![a-z])))?/i);
+    if (hm) return parseInt(hm[1], 10) * 60 + (hm[2] ? parseInt(hm[2], 10) : 0);
+
+    // 240 分鍾 / 240 分钟 / 240 minutes
+    const m = t.match(/(\d+)\s*(?:分鍾|分鐘|分钟|分|min(?:ute)?s?|m(?![a-z]))/i);
+    if (m) return parseInt(m[1], 10);
+
+    // 值本身就是纯数字（部分镜像站会省略单位）
+    const bare = t.match(/^(\d+(?:\.\d+)?)$/);
+    if (bare) return Math.round(parseFloat(bare[1]));
+
+    return null;
+  }
+
+  // 返回 { minutes, raw, source }；minutes 为 null 表示页面确实没有可解析的时长
+  function parseDuration(doc) {
+    const blockText = findDurationBlockText(doc);
+    const blockParsed = parseDurationFromValueText(blockText);
+    if (blockParsed !== null) {
+      return { minutes: blockParsed, raw: blockText || '', source: 'panel-block' };
+    }
+
+    // 回退：整块面板文本（保留旧逻辑，防止个别镜像站缺少 .panel-block 结构）
+    const panel = doc.querySelector('.movie-panel-info') || doc.body;
+    const text = ((panel && panel.textContent) || '').replace(NBSP_RE, " ");
+    const hm = text.match(DUR_HM_RE);
+    if (hm) {
+      return {
+        minutes: parseInt(hm[1], 10) * 60 + (hm[2] ? parseInt(hm[2], 10) : 0),
+        raw: hm[0],
+        source: 'panel-text'
+      };
+    }
+    const m = text.match(DUR_M_RE);
+    if (m) return { minutes: parseInt(m[1], 10), raw: m[0], source: 'panel-text' };
+
+    // bare-number fallback removed: it matched counts/dates without a duration label
+    // and wrongly skipped videos. Only label-anchored durations above are trusted.
+    return { minutes: null, raw: blockText || '', source: 'none' };
   }
 
   // resolve relative hrefs to absolute
@@ -1530,9 +1635,16 @@ btnGotoCode.addEventListener('click', () => {
         return null;
       }
 
-      const durationMin = parseDurationMin(detailDoc);
+      // 分类自带「4小時以上作品」标记时直接跳过，不依赖时长字段是否可解析
+      if (hasLongCompilationTag(detailDoc)) {
+        log(`[-] ${movieCode} 類別含「4小時以上作品」超长合集标记，跳过`);
+        return null;
+      }
+
+      const dur = parseDuration(detailDoc);
+      const durationMin = dur.minutes;
       if (durationMin !== null && durationMin > 150) {
-        log(`[-] ${movieCode} 时长 ${durationMin} 分钟，超过 150 分钟(2.5 小时)，跳过`);
+        log(`[-] ${movieCode} 时长 ${durationMin} 分钟（${dur.raw}），超过 150 分钟(2.5 小时)，跳过`);
         return null;
       }
 
