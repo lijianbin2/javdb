@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.16.1
+// @version      5.16.2
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT（每 100 条空行分组）；内置全自动自适应请求间隔（根据响应速度与限流情况自动提速降速，无需手动选择速度）；内置 429/封禁重试、备用域名自动切换与多标签排队保护；封禁跳转到新域名并重新登录后自动断点续抓（保留已抓磁链与进度）；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动识别登录图形验证码；自动跳过 VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -35,7 +35,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.16.1';
+  const SCRIPT_VERSION = '5.16.2';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -562,8 +562,11 @@
     } catch (e) { return null; }
   }
 
-  function clearResumeTask() {
-    try { lockStoreDel(TASK_RESUME_KEY); } catch (e) {}
+  function clearResumeTask(opts) {
+    // 其它标签页正在抓取时，不要替它删掉断点（它每 5 秒还会自己落盘）。
+    // 只有显式声明「可以删」时才真正删除，避免新标签页点开始把别人进行中的进度清空。
+    const keepForOtherTab = !!(opts && opts.allowWhileOtherTabRunning) && anotherTabIsRunning();
+    if (!keepForOtherTab) { try { lockStoreDel(TASK_RESUME_KEY); } catch (e) {} }
     resumeState = null;
   }
 
@@ -2358,8 +2361,9 @@ btnGotoCode.addEventListener('click', () => {
 
   function startFromPanel() {
     if (!isRunning) {
-      // 参数已改动 -> 视为新任务，丢弃旧断点
-      if (!panelMatchesResume()) { try { clearResumeTask(); } catch (e) {} }
+      // 参数已改动 -> 视为新任务，丢弃旧断点。
+      // 但若另一个标签页正在抓取，绝不能替它清断点（它还在每 5 秒落盘进度）。
+      if (!panelMatchesResume()) { try { clearResumeTask({ allowWhileOtherTabRunning: true }); } catch (e) {} }
       runScraper();
     } else {
       requestRestart();
@@ -2429,10 +2433,17 @@ btnGotoCode.addEventListener('click', () => {
     // 其他标签页正在抓取（锁未过期且持有者不是本标签）时，本页绝不自动续跑。
     // 典型场景：任务进行中点「番号跳转」开了新标签页，新页面不应抢跑旧任务。
     if (anotherTabIsRunning()) {
+      // 仍然恢复断点上下文与面板参数，但绝不自动开跑：
+      // 用户若想在这个页面接着抓，点「继续抓取」会走排队流程续抓原任务，
+      // 而不会因为 resumeState 为空被当成新任务并清掉别人正在跑的断点。
+      resumeState = data;
+      applyPanelInputs(data.inputs);
+      applyResumeMode(data.mode);
+      btnStart.textContent = '继续抓取';
       statusEl.innerText = '状态: 其他标签页正在抓取，本页不会自动继续';
       logHtml("<br><span style='color:#8fd3ff;'>🔒 检测到另一个标签页正在抓取（已抓 " + (data.results || []).length +
         " 条磁链）。本页不会自动继续该任务，可直接关闭本页；如需在原标签页继续请回到原页面操作。" +
-        "<br><span style='color:#888;'>（若原标签页其实已关闭，等待约 " + Math.ceil(LOCK_EXPIRY_MS / 1000) + " 秒后刷新本页即可自动续抓。）</span></span><br>");
+        "<br><span style='color:#888;'>（确实想在这个页面接着抓，可点「继续抓取」，它会自动排队接在原任务之后；若原标签页已经关闭，刷新本页即可自动续抓。）</span></span><br>");
       return;
     }
     if ((Date.now() - data.timestamp) > AUTO_RESUME_TTL_MS) {
