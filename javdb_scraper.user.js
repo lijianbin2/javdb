@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.16.0
+// @version      5.16.1
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT（每 100 条空行分组）；内置全自动自适应请求间隔（根据响应速度与限流情况自动提速降速，无需手动选择速度）；内置 429/封禁重试、备用域名自动切换与多标签排队保护；封禁跳转到新域名并重新登录后自动断点续抓（保留已抓磁链与进度）；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动识别登录图形验证码；自动跳过 VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -35,7 +35,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.16.0';
+  const SCRIPT_VERSION = '5.16.1';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -230,6 +230,19 @@
       return (Date.now() - t) > LOCK_EXPIRY_MS;
     } catch (e) {
       return true;
+    }
+  }
+
+  // 其他标签页是否正在抓取：锁存在、持有者不是本标签、且心跳仍在有效期内。
+  // 断点存在只说明「某个标签页抓到一半」，不代表现在没人在跑；
+  // 「番号跳转」新开的标签页据此避免把进行中的任务又自动跑一遍。
+  function anotherTabIsRunning() {
+    try {
+      const holder = lockStoreGet(LOCK_KEY);
+      if (!holder || holder === TAB_ID) return false;
+      return !isLockExpired();
+    } catch (e) {
+      return false;
     }
   }
 
@@ -2413,6 +2426,15 @@ btnGotoCode.addEventListener('click', () => {
     let data = null;
     try { data = loadResumeTask(); } catch (e) {}
     if (!data) return;
+    // 其他标签页正在抓取（锁未过期且持有者不是本标签）时，本页绝不自动续跑。
+    // 典型场景：任务进行中点「番号跳转」开了新标签页，新页面不应抢跑旧任务。
+    if (anotherTabIsRunning()) {
+      statusEl.innerText = '状态: 其他标签页正在抓取，本页不会自动继续';
+      logHtml("<br><span style='color:#8fd3ff;'>🔒 检测到另一个标签页正在抓取（已抓 " + (data.results || []).length +
+        " 条磁链）。本页不会自动继续该任务，可直接关闭本页；如需在原标签页继续请回到原页面操作。" +
+        "<br><span style='color:#888;'>（若原标签页其实已关闭，等待约 " + Math.ceil(LOCK_EXPIRY_MS / 1000) + " 秒后刷新本页即可自动续抓。）</span></span><br>");
+      return;
+    }
     if ((Date.now() - data.timestamp) > AUTO_RESUME_TTL_MS) {
       statusEl.innerText = '状态: 检测到未完成任务，可点「继续抓取」接着抓';
       btnStart.textContent = '继续抓取';
