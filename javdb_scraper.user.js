@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.15.4
+// @version      5.16.0
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT（每 100 条空行分组）；内置全自动自适应请求间隔（根据响应速度与限流情况自动提速降速，无需手动选择速度）；内置 429/封禁重试、备用域名自动切换与多标签排队保护；封禁跳转到新域名并重新登录后自动断点续抓（保留已抓磁链与进度）；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动识别登录图形验证码；自动跳过 VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -35,7 +35,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.15.4';
+  const SCRIPT_VERSION = '5.16.0';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -707,6 +707,7 @@
   // 刚探测失败的域名记入黑名单一段时间，避免反复跳到同一个死域名（来回弹跳）。
   const DEAD_DOMAIN_KEY = 'javdb_dead_domains';
   const DEAD_DOMAIN_TTL_MS = 2 * 60 * 60 * 1000; // 失效记忆 2 小时
+  const DEAD_DOMAIN_MAX_STRIKES = 3; // 连续失败最多把记忆延长到 3 倍 TTL（6 小时）
 
   function getDeadDomains() {
     try {
@@ -718,7 +719,19 @@
       const out = {};
       let changed = false;
       for (const k in obj) {
-        if (now - Number(obj[k]) < DEAD_DOMAIN_TTL_MS) out[k] = Number(obj[k]);
+        // 存储语义：{ t: 最后一次探测失败的时间戳, n: 连续失败次数 }
+        // 兼容旧版本直接存时间戳的格式（按 n=1 处理）。
+        const rec = obj[k];
+        let t = 0;
+        let n = 1;
+        if (rec && typeof rec === 'object') {
+          t = Number(rec.t || 0);
+          n = Math.min(DEAD_DOMAIN_MAX_STRIKES, Math.max(1, Number(rec.n) || 1));
+        } else {
+          t = Number(rec || 0);
+        }
+        // 记忆时长随连续失败次数递增：2h → 4h → 6h（封顶）
+        if (t && (now - t) < DEAD_DOMAIN_TTL_MS * n) out[k] = { t: t, n: n };
         else changed = true;
       }
       if (changed) { try { lockStoreSet(DEAD_DOMAIN_KEY, JSON.stringify(out)); } catch (e) {} }
@@ -730,10 +743,12 @@
     if (!domain) return;
     try {
       const dead = getDeadDomains();
-      const prev = dead[String(domain).toLowerCase()] || 0;
-      // 连续失败会延长记忆，但不超过 TTL 的 3 倍
-      const until = Date.now() + DEAD_DOMAIN_TTL_MS * Math.min(3, 1 + (prev ? 1 : 0));
-      dead[String(domain).toLowerCase()] = until;
+      const key = String(domain).toLowerCase();
+      const prev = dead[key];
+      // getDeadDomains 已过滤掉过期项，所以 prev 存在就说明记忆仍有效：
+      // 在此基础上累加连续失败次数，封顶 DEAD_DOMAIN_MAX_STRIKES 次。
+      const prevN = prev ? Math.min(DEAD_DOMAIN_MAX_STRIKES, Math.max(1, Number(prev.n) || 1)) : 0;
+      dead[key] = { t: Date.now(), n: prevN + 1 };
       lockStoreSet(DEAD_DOMAIN_KEY, JSON.stringify(dead));
     } catch (e) {}
   }
@@ -919,42 +934,6 @@
       return null;
     }
   }
-
-
-  let lastDomainUI = "";
-  function getCurrentNumericDomain() {
-    try {
-      const host = String(window.location.hostname || '').toLowerCase();
-      const match = host.match(/^javdb(\d+)\.com$/);
-      return match ? host : null;
-    } catch (e) { return null; }
-  }
-
-  function updateDomainStatusUI(force = false) {
-    const el = document.getElementById("scraper-domain-status");
-    if (!el) return;
-    const cached = getCachedDomain();
-    const currentDomain = getCurrentNumericDomain();
-    const isRefreshing = !!window.__javdbDomainRefreshing;
-    var nextHTML = "";
-    if (cached) {
-      const ageText = cached.time > 0 ? ` · ${((Date.now() - cached.time) / 3600000).toFixed(1)}h前` : '';
-      const checkText = isRefreshing ? ' · 检查中' : '';
-      nextHTML = `最新域名: <b style="color:#00d26a;">${escapeHtml(cached.domain)}</b> <span style="color:#888;">(${escapeHtml(cached.source||"缓存")}${ageText}${checkText})</span>`;
-    } else if (currentDomain) {
-      const checkText = isRefreshing ? '检查中' : '远端检查失败时使用备用列表';
-      nextHTML = `最新域名: <b style="color:#ffcc00;">${escapeHtml(currentDomain)}</b> <span style="color:#888;">(当前可用域名 · ${checkText})</span>`;
-    } else {
-      const checkText = isRefreshing ? '检查中' : '未缓存（将按备用列表兜底）';
-      nextHTML = `最新域名: <span style="color:#888;">${checkText}</span>`;
-    }
-    if (!force && nextHTML === lastDomainUI) {
-      return;
-    }
-    lastDomainUI = nextHTML;
-    el.innerHTML = nextHTML;
-  }
-
   async function refreshLatestDomain(manual = false) {
     const statusEl = document.getElementById('scraper-status');
     const logEl = document.getElementById('scraper-log');
@@ -964,7 +943,6 @@
     try {
       if (manual && statusEl) { statusEl.innerText = '状态: 正在同步最新域名...'; statusEl.style.color = '#ffcc00'; }
       if (logEl) { log("🔄 同步最新备用网址中..."); }
-      updateDomainStatusUI();
       res = await fetchLatestDomainMultiSource();
     } catch (e) {
       res = null;
@@ -973,12 +951,10 @@
     }
     if (res && res.domain) {
       setCachedDomain(res.domain, res.source);
-      updateDomainStatusUI();
     if (logEl) { logHtml("[" + escapeHtml(new Date().toLocaleTimeString()) + "] ✅ 已更新: <b>" + escapeHtml(res.domain) + "</b>（来源 " + escapeHtml(res.source) + ")<br>"); }
       if (statusEl && manual) { statusEl.innerText = `✅ 已同步: ${res.domain}`; statusEl.style.color = '#00d26a'; }
       return res.domain;
     } else {
-      updateDomainStatusUI();
     if (logEl) { log("[" + escapeHtml(new Date().toLocaleTimeString()) + "] ⚠️ 同步失败，使用本地缓存/兜底列表"); }
       if (statusEl && manual) { statusEl.innerText = '⚠️ 同步失败，已保留缓存'; statusEl.style.color = '#ff6b6b'; }
       return null;
@@ -990,34 +966,24 @@
     window.__javdbDomainSchedDone = true;
     if (domainAutoTimer) clearInterval(domainAutoTimer);
     // 启动时：若超过 6h 或无缓存则立即同步，否则仅更新 UI
-    try { updateDomainStatusUI(); } catch (e) {}
-    try {
-      setTimeout(() => { try { updateDomainStatusUI(true); } catch (e) {} }, 800);
-      setTimeout(() => { try { updateDomainStatusUI(true); } catch (e) {} }, 3000);
-    } catch (e) {}
     const cached = getCachedDomain();
     if (!cached || (Date.now() - cached.time) > DOMAIN_AUTO_UPDATE_INTERVAL_MS) {
       refreshLatestDomain(false);
-    } else {
-      updateDomainStatusUI();
     }
     domainAutoTimer = window.__javdbScraperTimer = setInterval(() => {
       // 页面可见时才请求，避免后台空转
       if (document.visibilityState === 'visible') refreshLatestDomain(false);
-      else updateDomainStatusUI();
     }, DOMAIN_AUTO_UPDATE_INTERVAL_MS);
     var lastVisSync = 0;
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
         var nowV = Date.now();
         if (nowV - lastVisSync < 60000) {
-          updateDomainStatusUI();
           return;
         }
         lastVisSync = nowV;
         const c = getCachedDomain();
         if (!c || (Date.now() - c.time) > DOMAIN_AUTO_UPDATE_INTERVAL_MS) refreshLatestDomain(false);
-        else updateDomainStatusUI();
       }
     });
     // 菜单命令
@@ -1033,7 +999,6 @@
   async function triggerDomainJump(reason = '检测到拦截封禁') {
     // 跳转前先落盘断点：新域名若要求重新登录，登录后可自动继续
     try { if (isRunning) saveResumeTask(reason); } catch (e) {}
-    removeFromQueue();
     document.title = origTitle;
     const currentHost = window.location.hostname.toLowerCase();
     try { broadcastBanForCurrentHost(); } catch (e) {}
@@ -1046,6 +1011,44 @@
     if (statusEl) {
       statusEl.innerText = `🚨 正在切号复活中...`;
       statusEl.style.color = '#ffcc00';
+    }
+
+    // 探测阶段最长可能持续近 100 秒，期间必须持续持有分布式锁：
+    // 否则同域名的其它标签页会认为队列无人而正常开跑，造成并发请求（更容易被封）。
+    // 真正发起跳转前再主动释放，避免新页面被旧锁挡住 45 秒。
+    let jumpBeat = null;
+    const stopJumpHeartbeat = () => {
+      if (jumpBeat) { try { clearInterval(jumpBeat); } catch (e) {} jumpBeat = null; }
+    };
+    const startJumpHeartbeat = () => {
+      stopJumpHeartbeat();
+      try { updateLockHeartbeat(); } catch (e) {}
+      jumpBeat = setInterval(function () { try { updateLockHeartbeat(); } catch (e) {} }, 3000);
+    };
+    const abortJump = (statusText, color) => {
+      stopJumpHeartbeat();
+      try { removeFromQueue(); } catch (e) {}
+      isJumping = false;
+      try { banStopped = true; shouldStop = true; } catch (e) {}
+      if (statusEl) { statusEl.innerText = statusText; statusEl.style.color = color || ''; }
+      try {
+        var bS0 = document.getElementById('btn-start');
+        var bT0 = document.getElementById('btn-stop');
+        if (bS0) bS0.disabled = false;
+        if (bT0) bT0.disabled = true;
+      } catch (e) {}
+    };
+    startJumpHeartbeat();
+
+    // 连续跳域上限前置判断：在花掉一整轮探测之前就停下，
+    // 也避免把「刚验证可用」的目标域名写进失效记忆。
+    if (getJumpAttempts().n >= JUMP_ATTEMPT_MAX) {
+      clearJumpAttempts();
+      if (logEl) {
+        logHtml("<br><span style='color:#ff5555; font-weight:bold;'>⚠️ 20 分钟内已连续切换 " + JUMP_ATTEMPT_MAX + " 次域名仍未稳定，已停止自动跳转。请手动打开可用的 JavDB 地址后再继续（已抓取进度已保存）。</span><br>");
+      }
+      abortJump('状态: 备用域名连续失效，已停止跳转', '#ff5555');
+      return;
     }
 
     // 候选顺序：实时多源 -> 缓存 -> 算号/静态兜底
@@ -1094,6 +1097,13 @@
     }
 
     for (const c of probeList) {
+      // 探测可被「停止」中断：整轮探测最坏要近 100 秒，不能让用户干等
+      if (shouldStop) {
+        if (logEl) logHtml("<br><span style='color:#ffcc00;'>⏹️ 已取消自动切换域名。</span><br>");
+        abortJump('状态: 已取消自动切换域名');
+        return;
+      }
+      try { updateLockHeartbeat(); } catch (e) {}
       const r = await probeDomain(c.domain);
       if (r.alive) {
         targetDomain = c.domain;
@@ -1109,25 +1119,14 @@
 
     if (logEl) {
       const deadN = Object.keys(getDeadDomains()).length;
-      if (deadN) logHtml("<span style='color:#888;'>📋 失效域名记录：" + deadN + " 个（两小时内不再尝试）</span><br>");
+      if (deadN) logHtml("<span style='color:#888;'>📋 失效域名记录：" + deadN + " 个（连续失败越多，记忆越久：2~" + (DEAD_DOMAIN_TTL_MS * DEAD_DOMAIN_MAX_STRIKES / 3600000) + " 小时）</span><br>");
     }
 
     if (!targetDomain || targetDomain === currentHost) {
       if (logEl) {
         logHtml("<br><span style='color:#ff5555; font-weight:bold;'>已在最小可用域名上且无备用域名可跳，已停止自动跳转。请稍后手动重试。</span><br>");
       }
-      if (statusEl) {
-        statusEl.innerText = '状态: 暂无可用备用域名，已停止';
-        statusEl.style.color = '';
-      }
-      try { banStopped = true; shouldStop = true; } catch (e) {}
-      isJumping = false;
-      try {
-        var bS0 = document.getElementById('btn-start');
-        var bT0 = document.getElementById('btn-stop');
-        if (bS0) bS0.disabled = false;
-        if (bT0) bT0.disabled = true;
-      } catch (e) {}
+      abortJump('状态: 暂无可用备用域名，已停止');
       return;
     }
 
@@ -1141,20 +1140,11 @@
       statusEl.innerText = `🔄 3秒后跳转至: ${targetDomain}`;
     }
 
-    // 连续跳域过多（说明备用域名大面积失效）时停下，避免无限跳
-    const jumpNo = bumpJumpAttempts();
-    if (jumpNo > JUMP_ATTEMPT_MAX) {
-      clearJumpAttempts();
-      try { markDomainDead(targetDomain, '连续跳域次数过多'); } catch (e) {}
-      if (logEl) {
-        logHtml("<br><span style='color:#ff5555; font-weight:bold;'>⚠️ 20 分钟内已连续切换 " + JUMP_ATTEMPT_MAX + " 次域名仍未稳定，已停止自动跳转。请手动打开可用的 JavDB 地址后再继续（已抓取进度已保存）。</span><br>");
-      }
-      if (statusEl) { statusEl.innerText = '状态: 备用域名连续失效，已停止跳转'; statusEl.style.color = '#ff5555'; }
-      try { banStopped = true; shouldStop = true; } catch (e) {}
-      isJumping = false;
-      return;
-    }
-
+    // 真正跳转前释放锁：新页面用的是新的 TAB_ID，
+    // 若把旧锁留到过期才清掉，断点续抓会白等 LOCK_EXPIRY_MS。
+    bumpJumpAttempts();
+    stopJumpHeartbeat();
+    try { removeFromQueue(); } catch (e) {}
     isJumping = true;
     try { shouldStop = true; } catch (e) {}
     setTimeout(() => {
@@ -1170,6 +1160,7 @@
       try {
         if (window.location.hostname === currentHost && isJumping) {
           isJumping = false;
+          try { removeFromQueue(); } catch (e) {}
           var sEl = document.getElementById("scraper-status");
           var bS = document.getElementById("btn-start");
           var bT = document.getElementById("btn-stop");
@@ -1178,7 +1169,7 @@
           if (bT) bT.disabled = true;
         }
       } catch (e) {}
-    }, 8000);
+    }, 15000);
   }
 
   // 页面入口即检查：若打开网页本身就是封禁页，立即触发切域名
@@ -1291,7 +1282,7 @@
     </div>
 
     <div id="scraper-log" style="margin-top: 8px; height: 90px; overflow-y: auto; background: #1e1e1e; color: #00ff66; padding: 6px; font-family: monospace; font-size: 11px; border-radius: 4px;">
-      🐢 已就绪：每个作品之间保持 2 秒间隔，降低请求频率...
+      🐢 已就绪：请求间隔将根据响应速度自动调整，遇到限流会自动退避，无需手动选择速度...
     </div>
   `;
 
@@ -1407,8 +1398,9 @@ btnGotoCode.addEventListener('click', () => {
   }
 
   async function fetchWithRetry(url, label = '请求') {
+    const MAX_ATTEMPTS = 4; // 含首次请求，最多发起 4 次（失败后重试 3 次）
     let lastStatus = 0;
-    for (let attempt = 0; attempt <= 3; attempt++) {
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       if (shouldStop) return null;
       updateLockHeartbeat();
       try {
@@ -1425,13 +1417,13 @@ btnGotoCode.addEventListener('click', () => {
         lastStatus = -1; paceOnThrottle('error');
         if (e && e.name === 'AbortError') log('timeout ' + label);
       }
-      if (attempt < 3) {
+      if (attempt < MAX_ATTEMPTS - 1) {
         const delay = Math.min(3000 * Math.pow(2, attempt), 30000) + getRandomDelay(0, 1000);
-        log(`⚠️ ${label}${lastStatus === 429 ? '触发限流' : (lastStatus >= 500 ? '服务器错误' : '网络错误')}，约 ${Math.round(delay / 1000)} 秒后重试 (${attempt + 1}/3)...`);
+        log(`⚠️ ${label}${lastStatus === 429 ? '触发限流' : (lastStatus >= 500 ? '服务器错误' : '网络错误')}，约 ${Math.round(delay / 1000)} 秒后重试 (${attempt + 1}/${MAX_ATTEMPTS - 1})...`);
         { const __t0 = Date.now(); let __left = delay; while (__left > 0) { if (shouldStop) return null; const __step = Math.min(5000, __left); await sleep(__step); updateLockHeartbeat(); __left = delay - (Date.now() - __t0); } }
       }
     }
-    log(`⚠️ ${label}重试 3 次仍失败，已跳过`);
+    log(`⚠️ ${label}重试 ${MAX_ATTEMPTS - 1} 次（共 ${MAX_ATTEMPTS} 次请求）仍失败，已跳过`);
     return null;
   }
 
@@ -1449,14 +1441,15 @@ btnGotoCode.addEventListener('click', () => {
     return Infinity;
   }
 
-  const DUR_LABELS = "(?:時長|时长|長度|长度|片長|片长|時間|时间|Length|Duration|Time)";
-  const DUR_HM_RE = new RegExp(DUR_LABELS + "[\s\S]{0,40}?(\d+)\s*(?:小時|小时|時|时|h(?:ours?|r)?)\s*(?:(\d+)\s*(?:分鍾|分鐘|分钟|分|min(?:ute)?s?))?", "i");
-  const DUR_M_RE = new RegExp(DUR_LABELS + "[\s\S]{0,40}?(\d+)\s*(?:分鍾|分鐘|分钟|分|min(?:ute)?s?)", "i");
   // 时长标签：strict 用于精确匹配整块标签，loose 用于「影片时长」这类带前缀的写法
   const DUR_LABEL_STRICT_RE = /^(?:時長|时长|長度|长度|片長|片长|時間|时间|length|duration|runtime|play\s*time|time)$/i;
-  const DUR_LABEL_LOOSE_RE = /(?:時長|时长|長度|长度|片長|片长|時間|时间|length|duration|runtime)/i;
-  // 「3:59」「03:59:59」这类钟表格式
-  const DUR_CLOCK_RE = /(\d{1,3})\s*[:：]\s*(\d{1,2})(?:\s*[:：]\s*(\d{1,2}))?/;
+  // loose 也必须整体锚定：只允许「影片时长」「播放時間」这类已知前缀，
+  // 否则「上次播放时间」「时间线」之类的块会被误当成时长块。
+  const DUR_LABEL_LOOSE_RE = /^(?:(?:影片|片子|視頻|视频|播放)?\s*(?:時長|时长|長度|长度|片長|片长|時間|时间)|length|duration|runtime|play\s*time)$/i;
+  // 「3:59」「03:59:59」这类钟表格式。
+  // 小时位允许 4 位，并用负向前瞻排除「前面还是数字」的情况，
+  // 避免把「1234:56」从中间截断成「234:56」。
+  const DUR_CLOCK_RE = /(?<![\d:])(\d{1,4})\s*[:：]\s*(\d{1,2})(?:\s*[:：]\s*(\d{1,2}))?(?![\d])/;
   // 分类标签里的超长合集标记（JavDB 自带，例如「4小時以上作品」）
   const LONG_COMPILATION_TAG_RE = /(?:^|[^0-9])(?:4|四)\s*(?:小時|小时|时|h)\s*(?:以上|或以上)/i;
 
@@ -1544,10 +1537,11 @@ btnGotoCode.addEventListener('click', () => {
     if (clock) {
       const a = parseInt(clock[1], 10);
       const b = parseInt(clock[2], 10);
-      if (clock[3] !== undefined) return a * 60 + b; // HH:MM:SS
-      // 两段式在时长语境下按 H:MM 解释（3:59 = 3 小时 59 分 = 239 分钟）。
+      // HH:MM:SS 的秒位不足 1 分钟，对「是否超过 150 分钟」的判定没有影响，
+      // 因此与两段式共用同一个换算：a 小时 b 分钟 = a*60+b。
+      // 两段式在时长语境下一律按 H:MM 解释（3:59 = 3 小时 59 分 = 239 分钟）：
       // MM:SS 写法在 JavDB 及镜像站从未出现，而本函数的目的是「宁可判长也别漏掉长片」，
-      // 故统一取较大值，避免 3:59 被当成 3 分钟而漏过超长合集。
+      // 故不取较小值，避免 3:59 被当成 3 分钟而漏过超长合集。
       return a * 60 + b;
     }
 
@@ -1574,22 +1568,9 @@ btnGotoCode.addEventListener('click', () => {
       return { minutes: blockParsed, raw: blockText || '', source: 'panel-block' };
     }
 
-    // 回退：整块面板文本（保留旧逻辑，防止个别镜像站缺少 .panel-block 结构）
-    const panel = doc.querySelector('.movie-panel-info') || doc.body;
-    const text = ((panel && panel.textContent) || '').replace(NBSP_RE, " ");
-    const hm = text.match(DUR_HM_RE);
-    if (hm) {
-      return {
-        minutes: parseInt(hm[1], 10) * 60 + (hm[2] ? parseInt(hm[2], 10) : 0),
-        raw: hm[0],
-        source: 'panel-text'
-      };
-    }
-    const m = text.match(DUR_M_RE);
-    if (m) return { minutes: parseInt(m[1], 10), raw: m[0], source: 'panel-text' };
-
-    // bare-number fallback removed: it matched counts/dates without a duration label
-    // and wrongly skipped videos. Only label-anchored durations above are trusted.
+    // 刻意不做整块面板文本回退：那种宽松匹配会把日期/评分/类别里的数字
+    // 当成时长，要么误杀正常影片，要么把长片算成几分钟而漏过超长合集。
+    // 只信任上面精确定位到的时长块；定位不到就返回 null（视为时长未知，不跳过）。
     return { minutes: null, raw: blockText || '', source: 'none' };
   }
 
