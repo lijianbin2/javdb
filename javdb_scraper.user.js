@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.16.5
+// @version      5.16.6
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT（每 100 条空行分组）；内置全自动自适应请求间隔（根据响应速度与限流情况自动提速降速，无需手动选择速度）；内置 429/封禁重试、备用域名自动切换与多标签排队保护；封禁跳转到新域名并重新登录后自动断点续抓（保留已抓磁链与进度）；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动识别登录图形验证码；自动跳过 VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -35,7 +35,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.16.5';
+  const SCRIPT_VERSION = '5.16.6';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -51,6 +51,7 @@
   let banStopped = false;
   let currentMode = 'current';
   let activeTask = null;      // 当前运行任务（用于封禁跳域名前保存断点）
+  let currentGen = 0; // 本轮抓取身份戳（v5.16.6 防僵尸断点复活）
   let resumeState = null;     // 待恢复的抓取断点
   let resumeAutoTimer = null; // 恢复流程的定时器句柄
   // —— 自适应请求间隔 ——
@@ -499,6 +500,7 @@
 
   // —— 断点续抓（跨域：GM 存储在所有 JavDB 镜像域名间共享）——
   const TASK_RESUME_KEY = 'javdb_resume_task';
+  const TASK_DONE_GEN_KEY = 'javdb_resume_done_gen'; // 已完成轮次的身份戳
   const RESUME_TTL_MS = 45 * 60 * 1000; // 断点有效期 45 分钟
   const AUTO_RESUME_TTL_MS = 20 * 60 * 1000; // 超过 20 分钟不再自动抢焦点，仅保留「继续抓取」按钮
   const RESUME_FIELD_MAP = {
@@ -543,6 +545,7 @@
         version: 1,
         timestamp: Date.now(),
         reason: reason || '',
+        gen: currentGen,
         mode: activeTask.mode || currentMode,
         inputs: collectPanelInputs(),
         results: (activeTask.results || []).slice(),
@@ -562,6 +565,7 @@
       const data = JSON.parse(raw);
       if (!data || data.version !== 1 || !Array.isArray(data.results)) return null;
       if (!data.timestamp || (Date.now() - data.timestamp) > RESUME_TTL_MS) { clearResumeTask(); return null; }
+      try { const __dg = lockStoreGet(TASK_DONE_GEN_KEY); if (__dg && Number(data.gen || 0) <= Number(__dg)) { clearResumeTask(); return null; } } catch (eG) {}
       return data;
     } catch (e) { return null; }
   }
@@ -1733,7 +1737,7 @@ btnGotoCode.addEventListener('click', () => {
   }
 
   async function runScraper() {
-    isRunning = true; shouldStop = false; isJumping = false; loginStopped = false; tagFailed = false; banStopped = false;
+    isRunning = true; shouldStop = false; isJumping = false; loginStopped = false; tagFailed = false; banStopped = false; currentGen = Date.now();
     restartRequested = false;
     paceReset(); // 每个新任务从自适应基准间隔重新起步
     btnStart.disabled = false; btnStart.textContent = '重新开始'; btnStop.disabled = false;
@@ -1766,8 +1770,9 @@ btnGotoCode.addEventListener('click', () => {
     activeTask = { mode: currentMode, results: results, doneCodes: doneCodes, needsBasePath: false };
     // 运行期间每 5 秒落盘一次断点：意外关闭标签 / 封禁跳域都不丢进度
     try {
+      const __myGen = currentGen;
       const periodic = setInterval(() => {
-        if (!isRunning || !activeTask) { clearInterval(periodic); return; }
+        if (!isRunning || !activeTask || __myGen !== currentGen) { clearInterval(periodic); return; }
         try { saveResumeTask('定期保存'); } catch (e) {}
       }, 5000);
     } catch (e) {}
@@ -2326,7 +2331,7 @@ btnGotoCode.addEventListener('click', () => {
 
     if (isJumping) return; // jump pending: keep jump status, skip re-enable
     // 断点只在「封禁跳域」或「需要登录」时保留；其余情况清理
-    if (!loginStopped) { try { clearResumeTask(); } catch (e) {} }
+    if (!loginStopped) { try { clearResumeTask(); } catch (e) {} try { lockStoreSet(TASK_DONE_GEN_KEY, String(currentGen || Date.now())); } catch (eD) {} }
     statusEl.style.color = '';
     statusEl.innerText = banStopped ? '状态: 同域封禁广播，已停止排队' : tagFailed ? '状态: 标签解析失败' : loginStopped ? '状态: 请先登录 JavDB 后再抓取' : (shouldStop ? '状态: 已手动停止' : '状态: 完成！');
     resetStartButton(); btnStop.disabled = true;
@@ -2382,7 +2387,7 @@ btnGotoCode.addEventListener('click', () => {
   }
 
   btnStart.onclick = () => { startFromPanel(); };
-  btnStop.onclick = () => { if (isRunning) { try { clearResumeTask(); } catch (e) {} shouldStop = true; statusEl.innerText = '状态: 正在停止...'; } };
+  btnStop.onclick = () => { if (isRunning) { try { clearResumeTask(); } catch (e) {} try { lockStoreSet(TASK_DONE_GEN_KEY, String(currentGen || Date.now())); } catch (eD2) {} shouldStop = true; statusEl.innerText = '状态: 正在停止...'; } };
 
   const handleEnterKey = (e) => {
     if (e.key === 'Enter') {
