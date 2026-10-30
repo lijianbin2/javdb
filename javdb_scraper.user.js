@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.16.6
+// @version      5.16.7
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT（每 100 条空行分组）；内置全自动自适应请求间隔（根据响应速度与限流情况自动提速降速，无需手动选择速度）；内置 429/封禁重试、备用域名自动切换与多标签排队保护；封禁跳转到新域名并重新登录后自动断点续抓（保留已抓磁链与进度）；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动识别登录图形验证码；自动跳过 VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -35,7 +35,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.16.6';
+  const SCRIPT_VERSION = '5.16.7';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -1771,8 +1771,12 @@ btnGotoCode.addEventListener('click', () => {
     // 运行期间每 5 秒落盘一次断点：意外关闭标签 / 封禁跳域都不丢进度
     try {
       const __myGen = currentGen;
+      let __lastSig = '';
       const periodic = setInterval(() => {
         if (!isRunning || !activeTask || __myGen !== currentGen) { clearInterval(periodic); return; }
+        const __sig = ((activeTask.results || []).length + ':' + (activeTask.doneCodes ? activeTask.doneCodes.size : 0));
+        if (__sig === __lastSig) return;
+        __lastSig = __sig;
         try { saveResumeTask('定期保存'); } catch (e) {}
       }, 5000);
     } catch (e) {}
