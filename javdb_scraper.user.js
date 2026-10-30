@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.16.2
+// @version      5.16.5
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT（每 100 条空行分组）；内置全自动自适应请求间隔（根据响应速度与限流情况自动提速降速，无需手动选择速度）；内置 429/封禁重试、备用域名自动切换与多标签排队保护；封禁跳转到新域名并重新登录后自动断点续抓（保留已抓磁链与进度）；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动识别登录图形验证码；自动跳过 VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -35,7 +35,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.16.2';
+  const SCRIPT_VERSION = '5.16.5';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -58,8 +58,8 @@
   // 连续成功时逐步提速，遇到 429/5xx/超时则自动降速并进入冷却。
   // 单一自适应档位：不再让用户选择速度，由脚本根据响应情况自动在
   // [AUTO_PACE.min, AUTO_PACE.max] 区间内自行调整间隔。
-  const AUTO_PACE = { base: 1100, min: 500, max: 12000, jitter: 0.30, slowRspMs: 2500, fastRspMs: 700 };
-  const paceState = { base: 0, floor: 0, cooldownUntil: 0, strikes: 0, inited: false, waitLogged: 0, slowRun: 0, fastRun: 0 };
+  const AUTO_PACE = { base: 2600, min: 2200, max: 15000, jitter: 0.35, slowRspMs: 2500, fastRspMs: 700 };
+  const paceState = { base: 0, floor: 0, cooldownUntil: 0, strikes: 0, inited: false, waitLogged: 0, slowRun: 0, fastRun: 0, okRun: 0 };
 
   function paceInit() {
     if (paceState.inited) return;
@@ -68,6 +68,7 @@
     paceState.cooldownUntil = 0;
     paceState.strikes = 0;
     paceState.waitLogged = 0;
+    paceState.okRun = 0;
     paceState.inited = true;
   }
 
@@ -76,13 +77,15 @@
     paceState.cooldownUntil = 0;
     paceState.strikes = 0;
     paceState.waitLogged = 0;
+    paceState.okRun = 0;
     paceInit();
   }
 
-  // 请求成功：逐步回落到基准（最快只到 AUTO_PACE.base，不无限加速）
+  // 请求成功：逐步回落到基准；连续很快才小幅收紧且绝不低于安全下限（防封优先）
   function paceOnSuccess(rspMs) {
     paceInit();
-    paceState.strikes = 0;
+    paceState.okRun = (paceState.okRun || 0) + 1;
+    if (paceState.okRun >= 5) { paceState.strikes = 0; paceState.okRun = 0; }
     // 响应时间反馈：连续多次变慢才放宽，连续多次很快才收紧。
     // 用连续计数避免被单次抖动（某次请求慢、CDN 冷启动等）带偏节奏。
     const ms = Number(rspMs);
@@ -95,10 +98,10 @@
       const grow = Math.min(500, Math.round((ms - AUTO_PACE.slowRspMs) / 4) + 120);
       paceState.base = Math.min(AUTO_PACE.max, paceState.base + grow);
       paceState.floor = Math.min(AUTO_PACE.max, paceState.floor + grow);
-    } else if (paceState.fastRun >= 3) {
+    } else if (paceState.fastRun >= 8) {
       paceState.fastRun = 0;
-      // 连续 3 次很快即明显收紧，保证网络恢复后能较快回到正常节奏
-      const shrink = Math.min(300, Math.max(150, Math.round((AUTO_PACE.fastRspMs - ms) / 2)));
+      // 连续 8 次很快才小幅收紧（防封优先，避免被突发快响应带偏）
+      const shrink = Math.min(100, Math.max(80, Math.round((AUTO_PACE.fastRspMs - ms) / 4)));
       paceState.base = Math.max(AUTO_PACE.min, paceState.base - shrink);
       paceState.floor = Math.max(AUTO_PACE.min, paceState.floor - shrink);
     } else if (paceState.slowRun === 0 && paceState.fastRun === 0) {
@@ -113,10 +116,11 @@
   function paceOnThrottle(kind) {
     paceInit();
     paceState.strikes++;
+    paceState.okRun = 0;
     const mult = kind === 'rate' ? 2.0 : 1.5;
-    paceState.base = Math.min(AUTO_PACE.max, Math.round(paceState.base * mult) + 400);
-    paceState.floor = Math.min(AUTO_PACE.max, Math.round(paceState.floor * mult) + 400);
-    const cool = Math.min(45000, (kind === 'rate' ? 4000 : 1500) * Math.pow(2, Math.min(paceState.strikes, 4)));
+    paceState.base = Math.min(AUTO_PACE.max, Math.round(paceState.base * mult) + 800);
+    paceState.floor = Math.min(AUTO_PACE.max, Math.round(paceState.floor * mult) + 800);
+    const cool = Math.min(120000, (kind === 'rate' ? 8000 : 3000) * Math.pow(2, Math.min(paceState.strikes, 4)));
     paceState.cooldownUntil = Math.max(paceState.cooldownUntil, Date.now() + cool);
   }
 
@@ -790,12 +794,12 @@
                 (typeof GM !== 'undefined' && GM && GM.xmlHttpRequest));
     } catch (e) { return false; }
   }
-  async function probeDomain(domain) {
+  async function probeDomain(domain, timeoutMs) {
     const d = String(domain || '').toLowerCase();
     if (!/^javdb\d*\.(com|org|net)$/.test(d) && d !== 'javdb.com') return { alive: false, reason: '域名格式不合法' };
     // 没有跨域请求能力时无法探测，此时不要因为探测失败而阻断跳转
     if (!hasGmRequest()) return { alive: true, reason: 'no-probe' };
-    const resp = await gmGet('https://' + d + '/', 5000);
+    const resp = await gmGet("https://" + d + "/", (timeoutMs||5000));
     if (!resp) return { alive: false, reason: '无法连接（超时/网络错误）' };
     const status = Number(resp.status) || 0;
     if (status === 0) return { alive: false, reason: '无响应' };
@@ -1095,6 +1099,13 @@
     const cached = getCachedDomain();
     if (cached) pushCand(cached.domain, '缓存:' + cached.source);
 
+    // v5.16.4 递增探测: 被封控跳域时 live 源 9 秒内经常拿不到(墙/超时),缓存也可能是旧的,而下面的兜底全是递减号段,真最新号段永远没人试.从已知最大号向上多探 6 个,命中即最新.
+    try {
+      const __numOf = (h) => { try { const mm = String(h || "").toLowerCase().match(/javdb(\d+)\.com/); return mm ? parseInt(mm[1], 10) : 0; } catch (eN) { return 0; } };
+      let __base = Math.max(__numOf(live && live.domain), __numOf(cached && cached.domain), __numOf(currentHost));
+      try { STATIC_BACKUP_DOMAINS.forEach((z) => { const zn = __numOf(z); if (zn > __base) __base = zn; }); } catch (eS) {}
+      for (let __i = 1; __i <= 6; __i++) pushCand("javdb" + (__base + __i) + ".com", "递增探测");
+    } catch (eUp) {}
     // 3) 算号递减 + 静态备用列表
     const fallbackList = buildBackupDomainList((live && live.domain) ? live.domain : (cached ? cached.domain : null));
     for (const d of fallbackList) pushCand(d, '兜底列表');
@@ -1120,14 +1131,14 @@
         return;
       }
       try { updateLockHeartbeat(); } catch (e) {}
-      const r = await probeDomain(c.domain);
+      const r = await probeDomain(c.domain, c.source === "递增探测" ? 3500 : 5000);
       if (r.alive) {
         targetDomain = c.domain;
         source = c.source;
         try { clearDomainDeadMark(c.domain); } catch (e) {}
         break;
       }
-      try { markDomainDead(c.domain, r.reason); } catch (e) {}
+      try { if (c.source !== "递增探测") markDomainDead(c.domain, r.reason); } catch (e) {}
       if (logEl) {
         logHtml("🚫 跳过 <b>" + escapeHtml(c.domain) + "</b>（" + escapeHtml(r.reason || '不可用') + "）<br>");
       }
@@ -1434,7 +1445,7 @@ btnGotoCode.addEventListener('click', () => {
         if (e && e.name === 'AbortError') log('timeout ' + label);
       }
       if (attempt < MAX_ATTEMPTS - 1) {
-        const delay = Math.min(3000 * Math.pow(2, attempt), 30000) + getRandomDelay(0, 1000);
+        const delay = Math.min((lastStatus === 429 ? 8000 : 3000) * Math.pow(2, attempt), 60000) + getRandomDelay(0, 2000);
         log(`⚠️ ${label}${lastStatus === 429 ? '触发限流' : (lastStatus >= 500 ? '服务器错误' : '网络错误')}，约 ${Math.round(delay / 1000)} 秒后重试 (${attempt + 1}/${MAX_ATTEMPTS - 1})...`);
         { const __t0 = Date.now(); let __left = delay; while (__left > 0) { if (shouldStop) return null; const __step = Math.min(5000, __left); await sleep(__step); updateLockHeartbeat(); __left = delay - (Date.now() - __t0); } }
       }
@@ -2404,6 +2415,7 @@ btnGotoCode.addEventListener('click', () => {
 
   function beginResumeTask() {
     if (isRunning || !resumeState) return;
+    try { if (!/javdb/i.test(String(window.location.hostname||"")) || !looksLikeJavDBPage()) return; } catch (eGG) {}
     // 保留 resumeState，让 runScraper 载入已抓磁链与已处理番号
     runScraper();
   }
@@ -2415,12 +2427,16 @@ btnGotoCode.addEventListener('click', () => {
       ticks++;
       if (isRunning) { clearInterval(resumeAutoTimer); resumeAutoTimer = null; return; }
       if (ticks % 2 === 0) autoCheckRememberMe();
-      if (!isStillLoginPage() || ticks > 300) {
+      if ((!isStillLoginPage() && /javdb/i.test(String(window.location.hostname||"")) && looksLikeJavDBPage()) || ticks > 900) {
         clearInterval(resumeAutoTimer);
         resumeAutoTimer = null;
-        if (!isStillLoginPage()) {
+        if (!isStillLoginPage() && /javdb/i.test(String(window.location.hostname||"")) && looksLikeJavDBPage()) {
           logHtml("<span style='color:#8fd3ff;'>✅ 登录已完成，正在恢复未完成的抓取任务...</span><br>");
           beginResumeTask();
+        } else if (ticks > 900) {
+          try { logHtml("<br><span style='color:#ffcc00;'>⏸️ 等待登录超时（15 分钟）。断点已保存（45 分钟内有效），登录完成后点「继续抓取」即可接着抓，已抓磁链不会丢。</span><br>"); } catch (eT) {}
+          try { var __st = document.getElementById('scraper-status'); if (__st) __st.innerText = '状态: 等待超时，断点已保存，可点「继续抓取」'; } catch (eS2) {}
+          try { if (typeof btnStart !== 'undefined' && btnStart) btnStart.textContent = '继续抓取'; } catch (eB2) {}
         }
       }
     }, 1000);
