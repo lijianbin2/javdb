@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.16.8
+// @version      5.16.9
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT（每 100 条空行分组）；内置全自动自适应请求间隔（根据响应速度与限流情况自动提速降速，无需手动选择速度）；内置 429/封禁重试、备用域名自动切换与多标签排队保护；封禁跳转到新域名并重新登录后自动断点续抓（保留已抓磁链与进度）；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动识别登录图形验证码；自动跳过 VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -35,7 +35,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.16.8';
+  const SCRIPT_VERSION = '5.16.9';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -302,6 +302,8 @@
         return false;
       }
       if (isFreshBanForCurrentHost()) {
+        try { log("🛑 检测到同域新鲜封禁广播，停止排队；断点已保留，刷新页面将自动切域续抓。"); } catch (eL) {}
+        try { banStopped = true; } catch (eB) {}
         try { removeFromQueue(); } catch (e) {}
         return false;
       }
@@ -1384,7 +1386,7 @@
     btnStart.disabled = false;
     btnStart.textContent = '开始抓取';
     // 断点只在「封禁跳域」或「需要登录」时保留；其余情况清理
-    if (!loginStopped && !isJumping) { try { clearResumeTask(); } catch (e) {} }
+    if (!loginStopped && !isJumping && !banStopped) { try { clearResumeTask(); } catch (e) {} }
   }
   function scheduleRestartIfNeeded() {
     if (!restartRequested) return;
@@ -1767,7 +1769,7 @@ btnGotoCode.addEventListener('click', () => {
     const lockAcquired = await acquireLock();
     if (!lockAcquired || shouldStop) {
       document.title = origTitle;
-      statusEl.innerText = '状态: 已取消';
+      statusEl.innerText = banStopped ? '状态: 同域封禁，断点已保留（刷新页面将自动切域续抓）' : '状态: 已取消';
       isRunning = false;
       resetStartButton(); btnStop.disabled = true;
       scheduleRestartIfNeeded();
@@ -2357,7 +2359,7 @@ btnGotoCode.addEventListener('click', () => {
 
     if (isJumping) return; // jump pending: keep jump status, skip re-enable
     // 断点只在「封禁跳域」或「需要登录」时保留；其余情况清理
-    if (!loginStopped) { try { clearResumeTask(); } catch (e) {} try { lockStoreSet(TASK_DONE_GEN_KEY, String(currentGen || Date.now())); } catch (eD) {} }
+    if (!loginStopped && !banStopped) { try { clearResumeTask(); } catch (e) {} try { lockStoreSet(TASK_DONE_GEN_KEY, String(currentGen || Date.now())); } catch (eD) {} }
     statusEl.style.color = '';
     statusEl.innerText = banStopped ? '状态: 同域封禁广播，已停止排队' : tagFailed ? '状态: 标签解析失败' : loginStopped ? '状态: 请先登录 JavDB 后再抓取' : (shouldStop ? '状态: 已手动停止' : '状态: 完成！');
     resetStartButton(); btnStop.disabled = true;
