@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.16.7
+// @version      5.16.8
 // @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT（每 100 条空行分组）；内置全自动自适应请求间隔（根据响应速度与限流情况自动提速降速，无需手动选择速度）；内置 429/封禁重试、备用域名自动切换与多标签排队保护；封禁跳转到新域名并重新登录后自动断点续抓（保留已抓磁链与进度）；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动识别登录图形验证码；自动跳过 VR 及时长超过 2.5 小时的作品。
 // @author       Assistant
 // @license      MIT
@@ -35,7 +35,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.16.7';
+  const SCRIPT_VERSION = '5.16.8';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -379,6 +379,27 @@
     try { if (isRunning) saveResumeTask('页面关闭'); } catch (e) {}
     removeFromQueue();
   });
+  // v5.16.8 关闭提醒补强：浏览器仅在页面有过交互时才弹关闭确认；跳域/恢复落地的新页面是零交互的，直接关会被静默放行。
+  function hasUserActivation() {
+    try {
+      if (navigator.userActivation) return !!(navigator.userActivation.hasBeenActive || navigator.userActivation.isActive);
+    } catch (eUA) {}
+    return true;
+  }
+  function armUnloadGuardOnce() {
+    try { if (hasUserActivation()) return; } catch (eHA) { return; }
+    try { logHtml("<br>⚠️ 当前页面还没有任何点击操作，现在直接关闭不会有确认弹窗。用鼠标点一下抓取面板（别点页面空白处，小心广告），之后关闭/刷新就会弹出确认。<br>"); } catch (eLG) {}
+    const __arm = () => {
+      try { document.removeEventListener("pointerdown", __arm); document.removeEventListener("keydown", __arm); } catch (eR) {}
+      try { log("✅ 已检测到页面操作，关闭确认保护已生效。"); } catch (eL2) {}
+    };
+    try { document.addEventListener("pointerdown", __arm); document.addEventListener("keydown", __arm); } catch (eAL) {}
+  }
+  try {
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden" && isRunning && activeTask) { try { saveResumeTask("页面隐藏"); } catch (eVH) {} }
+    });
+  } catch (eVL) {}
 
   // 纯数字备用域名列表（兜底）
   const STATIC_BACKUP_DOMAINS = [
@@ -1740,6 +1761,7 @@ btnGotoCode.addEventListener('click', () => {
     isRunning = true; shouldStop = false; isJumping = false; loginStopped = false; tagFailed = false; banStopped = false; currentGen = Date.now();
     restartRequested = false;
     paceReset(); // 每个新任务从自适应基准间隔重新起步
+    try { armUnloadGuardOnce(); } catch (eAG) {}
     btnStart.disabled = false; btnStart.textContent = '重新开始'; btnStop.disabled = false;
 
     const lockAcquired = await acquireLock();
