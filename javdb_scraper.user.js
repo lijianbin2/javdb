@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.16.9
-// @description  JavDB 磁链批量提取：支持按当前列表、番号段、女优/组合三种模式抓取磁力链接；当前列表支持作品范围与起始页码；自动优先字幕版并选择最小体积，去重后导出迅雷专用 TXT（每 100 条空行分组）；内置全自动自适应请求间隔（根据响应速度与限流情况自动提速降速，无需手动选择速度）；内置 429/封禁重试、备用域名自动切换与多标签排队保护；封禁跳转到新域名并重新登录后自动断点续抓（保留已抓磁链与进度）；每6小时定期自动同步最新备用网址(javdb.com/TG/官方App)并本地缓存；自动识别登录图形验证码；自动跳过 VR 及时长超过 2.5 小时的作品。
+// @version      5.16.10
+// @description  JavDB 磁链批量提取：支持当前列表（可设作品范围与起始页）、番号段、女优/组合三种模式，跨页连续抓取；磁链优先字幕版并取最小体积，去重后导出迅雷专用 TXT（每 100 条空行分组）；自动跳过 VR 与超过 2.5 小时（含「4小時以上」分类）的作品；全自动自适应请求间隔 2.2～15 秒，防封优先，遇 429/5xx 自动退避重试；备用域名每 6 小时自动同步 javdb.com/TG/官方 App，多候选探测、失效记忆与自动切换；多标签排队与分布式锁，避免并发请求；封禁跳域或需重新登录时自动保存断点，登录后继续；自动勾选「记住我」，登录页自动暂停等待（图形验证码需手动）。
 // @author       Assistant
 // @license      MIT
 // @match        *://javdb.com/*
@@ -35,7 +35,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.16.9';
+  const SCRIPT_VERSION = '5.16.10';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
