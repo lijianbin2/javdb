@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.16.11
-// @description  JavDB 磁链批量提取：支持当前列表（可设作品范围与起始页）、番号段、女优/组合三种模式，跨页连续抓取；磁链优先字幕版并取最小体积，去重后导出迅雷专用 TXT（每 100 条空行分组）；自动跳过 VR 与超过 2.5 小时（含「4小時以上」分类）的作品；全自动自适应请求间隔 3.5～30 秒，防封优先（站点风控升级后默认更慢），遇 429/5xx 自动退避重试；备用域名每 6 小时自动同步 javdb.com/TG/官方 App，官方地址 javdb581/582、app.javdb581/582、jav.app，多候选探测、失效记忆与自动切换；多标签排队与分布式锁；封禁跳域或需重新登录时自动保存断点，登录后继续；自动勾选「记住我」，登录页自动暂停等待（图形验证码需手动）。
+// @version      5.16.12
+// @description  JavDB 磁链批量提取：支持当前列表（可设作品范围与起始页）、番号段、女优/组合三种模式，跨页连续抓取；磁链优先字幕版并取最小体积，去重后导出迅雷专用 TXT（每 100 条空行分组）；自动跳过 VR 与超过 2.5 小时（含「4小時以上」分类）的作品；全自动自适应请求间隔（基准 3.5～30 秒，叠加随机抖动），防封优先（站点风控升级后默认更慢），遇 429/5xx 自动退避重试；备用域名每 6 小时自动同步 javdb.com/TG/官方 App，官方地址 javdb581/582、app.javdb581/582、jav.app，多候选探测、失效记忆与自动切换；多标签排队与分布式锁；封禁跳域或需重新登录时自动保存断点，登录后继续；自动勾选「记住我」，登录页自动暂停等待（图形验证码需手动）。
 // @author       Assistant
 // @license      MIT
 // @match        *://javdb.com/*
@@ -42,7 +42,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.16.11';
+  const SCRIPT_VERSION = '5.16.12';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -410,10 +410,10 @@
   } catch (eVL) {}
 
   // 纯数字备用域名列表（兜底）
-  // v5.16.11：按官方公告更新到当前最新号段（javdb581/582），并向下覆盖几档。
+  // v5.16.12：只保留当前确认能打开真实站点的号段。javdb576/579 已验证是空白挑战页、
+  // javdb577/578 的 TLS 已不可用，混在列表里只会浪费探测时间（探测逻辑也会拒绝它们）。
   const STATIC_BACKUP_DOMAINS = [
-    'javdb582.com', 'javdb581.com', 'javdb580.com', 'javdb579.com',
-    'javdb578.com', 'javdb577.com', 'javdb576.com', 'javdb575.com'
+    'javdb582.com', 'javdb581.com', 'javdb580.com', 'javdb575.com'
   ];
   // 自动更新域名：缓存键与定时
   const DOMAIN_CACHE_KEY = 'javdb_latest_domain';
@@ -842,6 +842,10 @@
     const body = String(resp.responseText || '');
     // 停放页 / 域名回收后的默认页
     if (body.length < 200 && !/javdb/i.test(body)) return { alive: false, reason: '疑似停放页' };
+    // v5.16.12：空白壳页 / Cloudflare 挑战页 / 停放页通常只有 1～2KB，且没有任何 JavDB 特征。
+    // 之前只按长度判断，会把 javdb576/579/587 这类空壳页判成可用，跳过去后只能靠自愈再跳一次。
+    const looksJavdb = /javdb/i.test(body) || /movie-list|磁力|番號|番号|女優|演员|影片/i.test(body);
+    if (!looksJavdb && body.length < 20000) return { alive: false, reason: '疑似停放/验证页（无 JavDB 特征）' };
     return { alive: true, reason: 'ok', status: status };
   }
 
