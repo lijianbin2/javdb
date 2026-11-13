@@ -1,14 +1,18 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.16.10
-// @description  JavDB 磁链批量提取：支持当前列表（可设作品范围与起始页）、番号段、女优/组合三种模式，跨页连续抓取；磁链优先字幕版并取最小体积，去重后导出迅雷专用 TXT（每 100 条空行分组）；自动跳过 VR 与超过 2.5 小时（含「4小時以上」分类）的作品；全自动自适应请求间隔 2.2～15 秒，防封优先，遇 429/5xx 自动退避重试；备用域名每 6 小时自动同步 javdb.com/TG/官方 App，多候选探测、失效记忆与自动切换；多标签排队与分布式锁，避免并发请求；封禁跳域或需重新登录时自动保存断点，登录后继续；自动勾选「记住我」，登录页自动暂停等待（图形验证码需手动）。
+// @version      5.16.11
+// @description  JavDB 磁链批量提取：支持当前列表（可设作品范围与起始页）、番号段、女优/组合三种模式，跨页连续抓取；磁链优先字幕版并取最小体积，去重后导出迅雷专用 TXT（每 100 条空行分组）；自动跳过 VR 与超过 2.5 小时（含「4小時以上」分类）的作品；全自动自适应请求间隔 3.5～30 秒，防封优先（站点风控升级后默认更慢），遇 429/5xx 自动退避重试；备用域名每 6 小时自动同步 javdb.com/TG/官方 App，官方地址 javdb581/582、app.javdb581/582、jav.app，多候选探测、失效记忆与自动切换；多标签排队与分布式锁；封禁跳域或需重新登录时自动保存断点，登录后继续；自动勾选「记住我」，登录页自动暂停等待（图形验证码需手动）。
 // @author       Assistant
 // @license      MIT
 // @match        *://javdb.com/*
 // @match        *://*.javdb.com/*
 // @match        *://*.javdb575.com/*
 // @match        *://javdb575.com/*
+// @match        *://*.javdb581.com/*
+// @match        *://javdb581.com/*
+// @match        *://*.javdb582.com/*
+// @match        *://javdb582.com/*
 // @include      /^https?:\/\/(www\.)?javdb\d*\.(com|org|net)\/.*$/
 // @grant        GM_xmlhttpRequest
 // @grant        GM.xmlHttpRequest
@@ -21,7 +25,10 @@
 // @connect      t.me
 // @connect      javdb.com
 // @connect      javdb575.com
+// @connect      javdb581.com
+// @connect      javdb582.com
 // @connect      app.javdb.com
+// @connect      jav.app
 // Dynamic app.javdbNNN.com has no partial-wildcard support and cannot be enumerated, keep * (see fetchLatestDomainFromApp).
 // @connect      *
 // @updateURL    https://update.greasyfork.org/scripts/598050/JavDB%20%E4%B8%87%E8%83%BD%E7%A3%81%E9%93%BE%E6%8F%90%E5%8F%96%E5%99%A8.user.js
@@ -35,7 +42,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.16.10';
+  const SCRIPT_VERSION = '5.16.11';
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -56,10 +63,9 @@
   let resumeAutoTimer = null; // 恢复流程的定时器句柄
   // —— 自适应请求间隔 ——
   // 不再是固定 2 秒 + 固定 1.2 秒抖动，而是「基准间隔 × 比例抖动 + 遇限流自动退避」。
-  // 连续成功时逐步提速，遇到 429/5xx/超时则自动降速并进入冷却。
-  // 单一自适应档位：不再让用户选择速度，由脚本根据响应情况自动在
-  // [AUTO_PACE.min, AUTO_PACE.max] 区间内自行调整间隔。
-  const AUTO_PACE = { base: 2600, min: 2200, max: 15000, jitter: 0.35, slowRspMs: 2500, fastRspMs: 700 };
+  // v5.16.11：官方公告显示站点已启用风控，对高频自动抓取会直接永久封号。
+  // 因此区间整体放慢到 3.5～30 秒、基准提高到 4 秒，并进一步收紧加速条件（防封优先）。
+  const AUTO_PACE = { base: 4000, min: 3500, max: 30000, jitter: 0.35, slowRspMs: 2500, fastRspMs: 600 };
   const paceState = { base: 0, floor: 0, cooldownUntil: 0, strikes: 0, inited: false, waitLogged: 0, slowRun: 0, fastRun: 0, okRun: 0 };
 
   function paceInit() {
@@ -99,10 +105,10 @@
       const grow = Math.min(500, Math.round((ms - AUTO_PACE.slowRspMs) / 4) + 120);
       paceState.base = Math.min(AUTO_PACE.max, paceState.base + grow);
       paceState.floor = Math.min(AUTO_PACE.max, paceState.floor + grow);
-    } else if (paceState.fastRun >= 8) {
+    } else if (paceState.fastRun >= 12) {
       paceState.fastRun = 0;
-      // 连续 8 次很快才小幅收紧（防封优先，避免被突发快响应带偏）
-      const shrink = Math.min(100, Math.max(80, Math.round((AUTO_PACE.fastRspMs - ms) / 4)));
+      // 连续 12 次很快才小幅收紧（防封优先：宁可慢，也不把节奏压回高频）
+      const shrink = Math.min(60, Math.max(40, Math.round((AUTO_PACE.fastRspMs - ms) / 4)));
       paceState.base = Math.max(AUTO_PACE.min, paceState.base - shrink);
       paceState.floor = Math.max(AUTO_PACE.min, paceState.floor - shrink);
     } else if (paceState.slowRun === 0 && paceState.fastRun === 0) {
@@ -121,7 +127,7 @@
     const mult = kind === 'rate' ? 2.0 : 1.5;
     paceState.base = Math.min(AUTO_PACE.max, Math.round(paceState.base * mult) + 800);
     paceState.floor = Math.min(AUTO_PACE.max, Math.round(paceState.floor * mult) + 800);
-    const cool = Math.min(120000, (kind === 'rate' ? 8000 : 3000) * Math.pow(2, Math.min(paceState.strikes, 4)));
+    const cool = Math.min(180000, (kind === 'rate' ? 15000 : 5000) * Math.pow(2, Math.min(paceState.strikes, 4)));
     paceState.cooldownUntil = Math.max(paceState.cooldownUntil, Date.now() + cool);
   }
 
@@ -404,9 +410,10 @@
   } catch (eVL) {}
 
   // 纯数字备用域名列表（兜底）
+  // v5.16.11：按官方公告更新到当前最新号段（javdb581/582），并向下覆盖几档。
   const STATIC_BACKUP_DOMAINS = [
-    'javdb575.com', 'javdb574.com', 'javdb573.com',
-    'javdb572.com', 'javdb571.com', 'javdb570.com'
+    'javdb582.com', 'javdb581.com', 'javdb580.com', 'javdb579.com',
+    'javdb578.com', 'javdb577.com', 'javdb576.com', 'javdb575.com'
   ];
   // 自动更新域名：缓存键与定时
   const DOMAIN_CACHE_KEY = 'javdb_latest_domain';
@@ -909,10 +916,12 @@
     if (n > 0) { push(appOf(ch)); for (let i = n + 2; i >= Math.max(1, n - 3); i--) push('https://app.javdb' + i + '.com/'); }
     STATIC_BACKUP_DOMAINS.forEach((z) => push(appOf(z)));
     push('https://app.javdb.com/');
+    // 官方永久 App 域名（公告：jav.app）；页面若不含域名文本会自动跳过，不会阻塞探测
+    push('https://jav.app/');
     return out;
   }
   async function fetchLatestDomainFromApp() {
-    // 官方 App 关于页常见域名：app.<mirror>.com / app.javdb.com
+    // 官方 App 关于页常见域名：app.<mirror>.com / app.javdb.com / jav.app
     let cachedDomain = null;
     try { const c0 = getCachedDomain(); if (c0 && c0.domain) cachedDomain = c0.domain; } catch (e) {}
     let curHost = '';
@@ -1472,7 +1481,7 @@ btnGotoCode.addEventListener('click', () => {
         if (e && e.name === 'AbortError') log('timeout ' + label);
       }
       if (attempt < MAX_ATTEMPTS - 1) {
-        const delay = Math.min((lastStatus === 429 ? 8000 : 3000) * Math.pow(2, attempt), 60000) + getRandomDelay(0, 2000);
+        const delay = Math.min((lastStatus === 429 ? 15000 : 5000) * Math.pow(2, attempt), 180000) + getRandomDelay(0, 3000);
         log(`⚠️ ${label}${lastStatus === 429 ? '触发限流' : (lastStatus >= 500 ? '服务器错误' : '网络错误')}，约 ${Math.round(delay / 1000)} 秒后重试 (${attempt + 1}/${MAX_ATTEMPTS - 1})...`);
         { const __t0 = Date.now(); let __left = delay; while (__left > 0) { if (shouldStop) return null; const __step = Math.min(5000, __left); await sleep(__step); updateLockHeartbeat(); __left = delay - (Date.now() - __t0); } }
       }
