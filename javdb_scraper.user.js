@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JavDB 万能磁链提取器
 // @namespace    http://tampermonkey.net/
-// @version      5.16.12
+// @version      5.16.13
 // @description  JavDB 磁链批量提取：支持当前列表（可设作品范围与起始页）、番号段、女优/组合三种模式，跨页连续抓取；磁链优先字幕版并取最小体积，去重后导出迅雷专用 TXT（每 100 条空行分组）；自动跳过 VR 与超过 2.5 小时（含「4小時以上」分类）的作品；全自动自适应请求间隔（基准 3.5～30 秒，叠加随机抖动），防封优先（站点风控升级后默认更慢），遇 429/5xx 自动退避重试；备用域名每 6 小时自动同步 javdb.com/TG/官方 App，官方地址 javdb581/582、app.javdb581/582、jav.app，多候选探测、失效记忆与自动切换；多标签排队与分布式锁；封禁跳域或需重新登录时自动保存断点，登录后继续；自动勾选「记住我」，登录页自动暂停等待（图形验证码需手动）。
 // @author       Assistant
 // @license      MIT
@@ -42,7 +42,11 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '5.16.12';
+  const SCRIPT_VERSION = '5.16.13';
+  // 转义表放到最前面：初始化阶段（如打开就是封禁页时立刻调用 triggerDomainJump）
+  // 就可能用到 escapeHtml，若这些常量声明在后面会触发 TDZ 报错。
+  const ESC_MAP = {"&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"};
+  const ESC_RE = /[&<>"']/g;
   function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
   function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
@@ -137,6 +141,29 @@
     const b = Math.max(paceState.base, paceState.floor);
     const jitter = 1 + (Math.random() * 2 - 1) * AUTO_PACE.jitter;
     return Math.max(300, Math.round(b * jitter));
+  }
+
+  // —— 请求级最小间隔（v5.16.13）——
+  // 之前只在「每个作品」前等待，番号检索的 3 个候选词、标签索引反查这类连续请求
+  // 会背靠背发出（一次作品最多 4～5 个请求挤在几秒内），在站点风控下风险明显更高。
+  // 现在任意两次请求之间也至少间隔一个自适应周期，冷却时间同样优先于常规间隔。
+  let __lastRequestStartedAt = 0;
+  async function waitRequestGap() {
+    paceInit();
+    const prev = __lastRequestStartedAt;
+    if (prev) {
+      let dueAt = prev + paceTargetMs();
+      if (paceState.cooldownUntil > dueAt) dueAt = paceState.cooldownUntil;
+      while (true) {
+        if (shouldStop) return false;
+        const left = dueAt - Date.now();
+        if (left <= 0) break;
+        await sleep(Math.min(250, left));
+        try { updateLockHeartbeat(); } catch (e) {}
+      }
+    }
+    __lastRequestStartedAt = Date.now();
+    return true;
   }
 
   var rmbCached = null;
@@ -1015,7 +1042,9 @@
       if (statusEl && manual) { statusEl.innerText = `✅ 已同步: ${res.domain}`; statusEl.style.color = '#00d26a'; }
       return res.domain;
     } else {
-    if (logEl) { log("[" + escapeHtml(new Date().toLocaleTimeString()) + "] ⚠️ 同步失败，使用本地缓存/兜底列表"); }
+      // 注意：log() 走 textContent，这里不需要（也不能）转义；
+      // 旧代码在这里调用 escapeHtml，初始化早期的失败分支会触发 ESC_RE 的 TDZ 报错。
+      if (logEl) { log("⚠️ 同步失败，使用本地缓存/兜底列表"); }
       if (statusEl && manual) { statusEl.innerText = '⚠️ 同步失败，已保留缓存'; statusEl.style.color = '#ff6b6b'; }
       return null;
     }
@@ -1028,7 +1057,8 @@
     // 启动时：若超过 6h 或无缓存则立即同步，否则仅更新 UI
     const cached = getCachedDomain();
     if (!cached || (Date.now() - cached.time) > DOMAIN_AUTO_UPDATE_INTERVAL_MS) {
-      refreshLatestDomain(false);
+      // 延后一拍再同步：此时面板与各元素引用才全部初始化完成
+      setTimeout(function () { try { refreshLatestDomain(false); } catch (eD) {} }, 0);
     }
     domainAutoTimer = window.__javdbScraperTimer = setInterval(() => {
       // 页面可见时才请求，避免后台空转
@@ -1338,8 +1368,6 @@
       </div>
     </div>
 
-    </div>
-
     <div id="scraper-status" style="margin-bottom: 6px; color: #aaa; font-size: 12px;">状态: 准备就绪</div>
     <div id="scraper-progress" style="margin-bottom: 8px; font-weight: bold; color: #00d26a; font-size: 13px;">进度: - / -</div>
 
@@ -1389,12 +1417,14 @@
     });
   });
 
-  const statusEl = document.getElementById('scraper-status');
-  const progressEl = document.getElementById('scraper-progress');
-  const logEl = document.getElementById('scraper-log');
-  const btnStart = document.getElementById('btn-start');
-  const btnStop = document.getElementById('btn-stop');
-  const btnGotoCode = document.getElementById('btn-goto-code');
+  // 用 var 而不是 const：初始化早期（域名同步失败分支、自动续抓）就可能调用 log()/logHtml()，
+  // 若这里处于 TDZ 会抛出 "Cannot access 'logEl' before initialization"。
+  var statusEl = document.getElementById('scraper-status');
+  var progressEl = document.getElementById('scraper-progress');
+  var logEl = document.getElementById('scraper-log');
+  var btnStart = document.getElementById('btn-start');
+  var btnStop = document.getElementById('btn-stop');
+  var btnGotoCode = document.getElementById('btn-goto-code');
   function resetStartButton() {
     btnStart.disabled = false;
     btnStart.textContent = '开始抓取';
@@ -1435,11 +1465,13 @@ btnGotoCode.addEventListener('click', () => {
 
 
   function logTrim() {
+    if (!logEl) return;
     while (logEl.childElementCount > 400) {
       logEl.removeChild(logEl.firstChild);
     }
   }
   function logHtml(html) {
+    if (!logEl) return;
     var d = document.createElement("div");
     d.innerHTML = html;
     logEl.appendChild(d);
@@ -1447,6 +1479,7 @@ btnGotoCode.addEventListener('click', () => {
     logEl.scrollTop = logEl.scrollHeight;
   }
   function log(msg) {
+    if (!logEl) return;
     const time = new Date().toLocaleTimeString();
     var row = document.createElement("div");
     row.textContent = "[" + time + "] " + msg;
@@ -1457,9 +1490,6 @@ btnGotoCode.addEventListener('click', () => {
 
   // sleep/getRandomDelay hoisted to top (SCRIPT_VERSION block).
 
-  const ESC_MAP = {"&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"};
-
-  const ESC_RE = /[&<>"']/g;
   function escapeHtml(str) {
     return String(str).replace(ESC_RE, (c) => ESC_MAP[c]);
   }
@@ -1467,6 +1497,8 @@ btnGotoCode.addEventListener('click', () => {
   async function fetchWithRetry(url, label = '请求') {
     const MAX_ATTEMPTS = 4; // 含首次请求，最多发起 4 次（失败后重试 3 次）
     let lastStatus = 0;
+    // 请求级排队：连续请求（检索候选、标签反查等）也要拉开间隔
+    if (!(await waitRequestGap())) return null;
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       if (shouldStop) return null;
       updateLockHeartbeat();
@@ -1479,6 +1511,11 @@ btnGotoCode.addEventListener('click', () => {
         const rspMs = Date.now() - reqStart;
         if (res.status === 429) { lastStatus = 429; paceOnThrottle('rate'); }
         else if (res.status >= 500 && res.status <= 599) { lastStatus = res.status; paceOnThrottle('error'); }
+        else if (res.status === 403 || res.status === 451) {
+          // 封禁 / 地区限制页：既不是网络错误（不重试，避免在封禁会话上继续补刀），
+          // 也不能算「成功」——否则被拦截后的快响应反而会把自适应节奏调快。
+          return res;
+        }
         else { paceOnSuccess(rspMs); return res; }
       } catch (e) {
         lastStatus = -1; paceOnThrottle('error');
@@ -1543,17 +1580,19 @@ btnGotoCode.addEventListener('click', () => {
     return tokens;
   }
 
-  function hasVrCategory(doc) {
-    return getCategoryTokens(doc).some(t => VR_TOKEN_RE.test(t));
-  }
-
-  // 分类里带「4小時以上作品」这类标记时，即使时长字段缺失也判定为超长合集
-  function hasLongCompilationTag(doc) {
+  // 一次遍历同时判断 VR 与「4小時以上作品」，避免对同一份分类列表查两遍 DOM
+  function categoryFlags(doc) {
+    let vr = false;
+    let longTag = false;
     try {
-      return getCategoryTokens(doc).some(t => LONG_COMPILATION_TAG_RE.test(t));
-    } catch (e) {
-      return false;
-    }
+      const tokens = getCategoryTokens(doc);
+      for (const t of tokens) {
+        if (!vr && VR_TOKEN_RE.test(t)) vr = true;
+        if (!longTag && LONG_COMPILATION_TAG_RE.test(t)) longTag = true;
+        if (vr && longTag) break;
+      }
+    } catch (e) {}
+    return { vr: vr, longTag: longTag };
   }
 
   function blockValueText(block) {
@@ -1678,13 +1717,15 @@ btnGotoCode.addEventListener('click', () => {
       const parser = sharedParser() || new DOMParser();
       const detailDoc = parser.parseFromString(detailHtml, 'text/html');
 
-      if (hasVrCategory(detailDoc)) {
+      const catFlags = categoryFlags(detailDoc);
+
+      if (catFlags.vr) {
         log(`[-] ${movieCode} 類別含 VR，跳过`);
         return null;
       }
 
       // 分类自带「4小時以上作品」标记时直接跳过，不依赖时长字段是否可解析
-      if (hasLongCompilationTag(detailDoc)) {
+      if (catFlags.longTag) {
         log(`[-] ${movieCode} 類別含「4小時以上作品」超长合集标记，跳过`);
         return null;
       }
@@ -1832,7 +1873,10 @@ btnGotoCode.addEventListener('click', () => {
           if (lockStoreGet(LOCK_KEY) !== TAB_ID) {
             log('丢失排队锁，重新排队等待中...');
             const ok = await acquireLock();
-            if (!ok || shouldStop) return false;
+            // 排队被拒（同域封禁广播 / 已停止）时必须同步置位 shouldStop，
+            // 否则外层 while 会以为还能继续，接着去翻下一页。
+            if (!ok) { shouldStop = true; return false; }
+            if (shouldStop) return false;
             lastItemStartedAt = Date.now();
             return true;
           }
@@ -1845,8 +1889,8 @@ btnGotoCode.addEventListener('click', () => {
 
       paceInit();
       const now = Date.now();
-      // 起点对齐：距上次发起请求满目标间隔即可放行
-      let dueAt = lastItemStartedAt + paceTargetMs();
+      // 起点对齐：距上一次真正发出请求满目标间隔即可放行（请求级间隔可能比作品起点更晚）
+      let dueAt = Math.max(lastItemStartedAt, __lastRequestStartedAt) + paceTargetMs();
       // 限流冷却优先于常规间隔
       if (paceState.cooldownUntil > dueAt) dueAt = paceState.cooldownUntil;
       const waitMs = dueAt - now;
@@ -1944,33 +1988,30 @@ btnGotoCode.addEventListener('click', () => {
               const aTag = item.querySelector('a');
               const rawHref = aTag ? aTag.getAttribute('href') : null;
               if (!rawHref || rawHref.indexOf('/v/') < 0) {
-                if (!(await waitForNextItemSlot())) break;
+                // 没有详情链接的条目（广告 / 占位）不会发起请求，不必占用请求间隔
                 processedTargets++;
                 progressEl.innerText = '进度: (' + processedTargets + '/' + totalTargets + ')';
                 continue;
               }
 
-              const codeEl0 = item.querySelector('.uid') || item.querySelector('strong');
-              const movieCode0 = codeEl0 ? codeEl0.textContent.trim() : ('作品' + absolutePosition);
+              const codeEl = item.querySelector('.uid') || item.querySelector('strong');
+              const movieCode = codeEl ? codeEl.textContent.trim() : ('作品' + absolutePosition);
 
               processedTargets++;
               progressEl.innerText = '进度: (' + processedTargets + '/' + totalTargets + ')';
               document.title = '⚡[抓取 ' + processedTargets + '/' + totalTargets + '] ' + origTitle;
 
               // 断点续抓：已处理过的番号直接跳过详情页请求
-              if (doneCodes.has(movieCode0)) {
-                log(`↩️ 已处理，跳过: ${movieCode0}`);
+              if (doneCodes.has(movieCode)) {
+                log(`↩️ 已处理，跳过: ${movieCode}`);
                 continue;
               }
 
               if (!(await waitForNextItemSlot())) break;
 
-              const movieHref = rawHref;
-              const codeEl = item.querySelector('.uid') || item.querySelector('strong');
-              const movieCode = codeEl ? codeEl.textContent.trim() : ('作品' + absolutePosition);
               log('提取中: 第' + absolutePosition + '个 ' + movieCode + '...');
 
-              const magnet = await processDetailPage(movieHref, movieCode);
+              const magnet = await processDetailPage(rawHref, movieCode);
               if (magnet === 'IP_BANNED') {
                 await triggerDomainJump('抓取中遭遇域名拦截');
                 break;
