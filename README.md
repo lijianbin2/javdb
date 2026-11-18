@@ -4,7 +4,7 @@
 
 脚本支持**当前列表**、**番号段**和**女优/组合**三种抓取模式，可以自动筛选磁链、去除重复结果，并导出迅雷专用 TXT 文件。
 
-- 当前版本：`5.16.13`
+- 当前版本：`5.16.14`
 - 支持站点：JavDB 页面
 - 运行环境：Chrome、Edge、Firefox 等支持 Tampermonkey 的浏览器
 
@@ -367,6 +367,11 @@ JavDB 域名可能发生变化。脚本每 6 小时尝试同步一次最新可�
 备用源：[GitHub Raw](https://raw.githubusercontent.com/lijianbin2/javdb/main/javdb_scraper.user.js)
 
 ## 更新记录
+
+### 5.16.14
+
+- 更新 Greasy Fork 简介（`@description`）：补上「连续请求同样排队」与官方域名括号说明，保持与 5.16.13 的请求级排队实现一致。
+- 本次只改元数据与文档，脚本逻辑与 5.16.13 相同。
 
 ### 5.16.13
 
